@@ -61,7 +61,7 @@ Step 7: Verify the PR shows updated status
 First, figure out which local branch corresponds to PR 532. You can find this by:
 1. Going to your PR: https://github.com/Yeraze/meshmonitor/pull/532
 2. Looking at the branch name shown in the PR header
-3. It will say something like "temalo:feature-branch-name wants to merge into Yeraze:main"
+3. It will say something like "yourusername:feature-branch-name wants to merge into Yeraze:main"
 
 For this example, let's assume your branch is called `feature/my-feature`.
 
@@ -82,7 +82,7 @@ git remote -v
 # If you don't see 'upstream' pointing to Yeraze/meshmonitor, add it:
 git remote add upstream https://github.com/Yeraze/meshmonitor.git
 
-# Fetch the latest changes from upstream
+# Fetch the latest changes from upstream (this may take a moment)
 git fetch upstream
 
 # Fetch your fork's latest changes

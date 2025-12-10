@@ -36,7 +36,7 @@ print_warning() {
 }
 
 print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
+    echo -e "${BLUE}ℹ️  $1${NC}"
 }
 
 # Step 0: Verify we're in a git repository
@@ -82,7 +82,7 @@ if [ -n "$(git status --porcelain)" ]; then
     read -p "Do you want to stash these changes? (y/n): " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        git stash push -m "Auto-stash before rebase PR 532"
+        git stash push -m "Auto-stash before rebase PR 532 - $(date '+%Y-%m-%d %H:%M:%S')"
         print_success "Changes stashed"
         STASHED=true
     else
@@ -97,7 +97,7 @@ echo ""
 
 # Step 3: Create backup branch
 print_info "Step 3: Creating backup branch..."
-BACKUP_BRANCH="${FEATURE_BRANCH}-backup-$(date +%Y%m%d-%H%M%S)"
+BACKUP_BRANCH="${FEATURE_BRANCH}-rebase-backup-$(date +%Y%m%d-%H%M%S)"
 git branch "$BACKUP_BRANCH"
 print_success "Backup created: $BACKUP_BRANCH"
 echo ""
