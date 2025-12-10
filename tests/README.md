@@ -22,7 +22,7 @@ cd /path/to/meshmonitor
 ./tests/system-tests.sh
 ```
 
-**Note:** The script automatically detects the project root and can technically be run from any directory, but running from the project root is recommended for clarity.
+**Note:** The script automatically detects the project root using its own location and changes to it (see lines 36-40 in the script). You can run it from any directory, but running from the project root is recommended for clarity.
 
 **What the script does:**
 1. Build a fresh Docker image from current code
@@ -276,9 +276,17 @@ sudo systemctl start docker  # Linux
 1. **Node not connecting**: Verify the Meshtastic node at 192.168.5.106 is accessible
 2. **Port conflicts**: Check if ports 8083/8084 are already in use
    ```bash
-   # Check if ports are in use
+   # Check if ports are in use (Linux/macOS with lsof)
    lsof -i :8083
    lsof -i :8084
+   
+   # Alternative for Linux without lsof
+   netstat -tulpn | grep :8083
+   netstat -tulpn | grep :8084
+   
+   # Alternative for Windows
+   netstat -an | findstr :8083
+   netstat -an | findstr :8084
    ```
 3. **Docker issues**: Ensure Docker daemon is running and you have permissions
    ```bash

@@ -1,6 +1,7 @@
 #!/bin/bash
 # System Tests - Full deployment verification
-# Runs comprehensive test suite including configuration, deployment, security, and backup tests
+# Runs 7 test suites: Configuration Import, Quick Start, Security, Reverse Proxy,
+# Reverse Proxy + OIDC, Virtual Node CLI, and Backup & Restore
 #
 # USAGE:
 #   Run from the project root directory:
