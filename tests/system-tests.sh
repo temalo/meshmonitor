@@ -1,6 +1,6 @@
 #!/bin/bash
 # System Tests - Full deployment verification
-# Runs both Quick Start and Reverse Proxy tests with fresh environment
+# Runs comprehensive test suite including configuration, deployment, security, and backup tests
 #
 # USAGE:
 #   Run from the project root directory:
