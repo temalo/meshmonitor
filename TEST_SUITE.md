@@ -35,8 +35,10 @@ A comprehensive test suite has been implemented for MeshMonitor using Vitest as 
 
 ## Running Tests
 
+### Unit Tests
+
 ```bash
-# Run all tests once
+# Run all unit tests once
 npm run test:run
 
 # Run tests in watch mode
@@ -48,6 +50,32 @@ npm run test:ui
 # Generate coverage report
 npm run test:coverage
 ```
+
+### System Tests (End-to-End)
+
+For comprehensive deployment testing using Docker:
+
+```bash
+# Navigate to project root directory
+cd /path/to/meshmonitor
+
+# Run full system test suite
+./tests/system-tests.sh
+
+# Or with custom node IP
+TEST_NODE_IP=192.168.1.100 ./tests/system-tests.sh
+```
+
+**System tests verify:**
+- Configuration import and device configuration
+- Quick Start deployment (HTTP, zero-config)
+- Security and authentication
+- Reverse Proxy deployment (HTTPS, production)
+- OIDC authentication integration
+- Virtual Node CLI functionality
+- System backup and restore
+
+See [tests/README.md](tests/README.md) for detailed documentation and troubleshooting.
 
 ## Testing Stack
 

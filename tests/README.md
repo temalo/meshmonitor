@@ -12,19 +12,33 @@ This directory contains automated tests that verify MeshMonitor works correctly 
 
 ## Quick Start
 
-Run all system tests (recommended before creating/updating PRs):
+### Running the Script
+
+Run all system tests from the **project root directory** (recommended before creating/updating PRs):
 
 ```bash
+# From the project root directory
+cd /path/to/meshmonitor
 ./tests/system-tests.sh
 ```
 
-This will:
+**Note:** The script automatically detects the project root and can technically be run from any directory, but running from the project root is recommended for clarity.
+
+**What the script does:**
 1. Build a fresh Docker image from current code
 2. Clean up any existing test volumes
-3. Run the Quick Start deployment test
-4. Run the Reverse Proxy deployment test
-5. Run the Reverse Proxy + OIDC deployment test
-6. Report overall results
+3. Run the Configuration Import test
+4. Run the Quick Start deployment test
+5. Run the Security test
+6. Run the Reverse Proxy deployment test
+7. Run the Reverse Proxy + OIDC deployment test
+8. Run the Virtual Node CLI test
+9. Run the Backup & Restore test
+10. Report overall results and generate a markdown report
+
+**Generated Output:**
+- Console output with colored test results
+- `test-results.md` - Markdown report with detailed test summary
 
 ## Individual Test Scripts
 
@@ -209,12 +223,76 @@ The `system-tests.sh` script also performs cleanup before running tests to ensur
 
 ## Troubleshooting
 
+### Script Execution Errors
+
+#### "Permission denied" or "command not found"
+
+Make sure the script is executable and you're in the correct directory:
+
+```bash
+# Make the script executable
+chmod +x tests/system-tests.sh
+
+# Run from project root
+cd /path/to/meshmonitor
+./tests/system-tests.sh
+
+# Or run with bash explicitly
+bash tests/system-tests.sh
+```
+
+#### "No such file or directory"
+
+Ensure you're running from the project root:
+
+```bash
+# Check current directory
+pwd
+
+# Should be in the meshmonitor project root
+# If not, navigate to it:
+cd /path/to/meshmonitor
+
+# Then run the script
+./tests/system-tests.sh
+```
+
+#### Script runs but immediately fails
+
+Check that Docker is installed and running:
+
+```bash
+# Check Docker status
+docker --version
+docker ps
+
+# If Docker is not running, start it
+sudo systemctl start docker  # Linux
+# or use Docker Desktop on macOS/Windows
+```
+
 ### Tests Failing
 
 1. **Node not connecting**: Verify the Meshtastic node at 192.168.5.106 is accessible
 2. **Port conflicts**: Check if ports 8083/8084 are already in use
+   ```bash
+   # Check if ports are in use
+   lsof -i :8083
+   lsof -i :8084
+   ```
 3. **Docker issues**: Ensure Docker daemon is running and you have permissions
+   ```bash
+   # Check Docker permissions
+   docker ps
+   # If permission denied, add your user to docker group
+   sudo usermod -aG docker $USER
+   # Then log out and back in
+   ```
 4. **Image build fails**: Check for build errors in the output
+   ```bash
+   # Try building manually to see detailed errors
+   docker build -t meshmonitor:test -f Dockerfile .
+   ```
 
 ### Running Individual Tests
 

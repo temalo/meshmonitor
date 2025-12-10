@@ -8,9 +8,14 @@ Thank you for your interest in contributing to MeshMonitor! This guide will help
 
 ### System Tests (End-to-End)
 
-We also have a comprehensive system test suite that verifies the full deployment using Docker.
+We have a comprehensive system test suite that verifies the full deployment using Docker.
+
+**Important:** Run these commands from the **project root directory** (the `meshmonitor` directory):
 
 ```bash
+# Navigate to project root (if not already there)
+cd /path/to/meshmonitor
+
 # Run the full system test suite (builds fresh Docker image)
 ./tests/system-tests.sh
 
@@ -20,6 +25,14 @@ We also have a comprehensive system test suite that verifies the full deployment
 # Run tests against a specific Meshtastic node
 TEST_NODE_IP=192.168.1.50 ./tests/system-tests.sh
 ```
+
+**What the system tests do:**
+- Build a fresh Docker image from your current code
+- Run configuration import, quick start, security, reverse proxy, OIDC, virtual node CLI, and backup/restore tests
+- Generate a detailed markdown report (`test-results.md`)
+- Automatically clean up test containers and volumes
+
+See [tests/README.md](tests/README.md) for detailed documentation and troubleshooting.
 
 ### Running Tests Locally
 

@@ -172,9 +172,14 @@ npm run test:ui
 
 ### System Tests (End-to-End)
 
-We also have a comprehensive system test suite that verifies the full deployment using Docker.
+We have a comprehensive system test suite that verifies the full deployment using Docker.
+
+**Important:** Run these commands from the **project root directory** (the `meshmonitor` directory):
 
 ```bash
+# Navigate to project root (if not already there)
+cd /path/to/meshmonitor
+
 # Run the full system test suite (builds fresh Docker image)
 ./tests/system-tests.sh
 
@@ -184,6 +189,8 @@ We also have a comprehensive system test suite that verifies the full deployment
 # Run tests against a specific Meshtastic node
 TEST_NODE_IP=192.168.1.50 ./tests/system-tests.sh
 ```
+
+For detailed documentation on the system tests, including troubleshooting and what each test does, see [tests/README.md](../../tests/README.md).
 
 ### Writing Tests
 

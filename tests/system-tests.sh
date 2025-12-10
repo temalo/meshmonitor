@@ -1,6 +1,23 @@
 #!/bin/bash
 # System Tests - Full deployment verification
 # Runs both Quick Start and Reverse Proxy tests with fresh environment
+#
+# USAGE:
+#   Run from the project root directory:
+#     cd /path/to/meshmonitor
+#     ./tests/system-tests.sh
+#
+#   Or with custom node IP:
+#     TEST_NODE_IP=192.168.1.100 ./tests/system-tests.sh
+#
+#   The script automatically detects the project root and can be run from
+#   any directory, but running from the project root is recommended.
+#
+# OUTPUT:
+#   - Colored console output with test results
+#   - test-results.md - Detailed markdown report
+#
+# See tests/README.md for detailed documentation and troubleshooting.
 
 set -e  # Exit on any error
 
