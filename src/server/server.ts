@@ -33,7 +33,8 @@ import { systemRestoreService } from './services/systemRestoreService.js';
 import { duplicateKeySchedulerService } from './services/duplicateKeySchedulerService.js';
 import { solarMonitoringService } from './services/solarMonitoringService.js';
 import { inactiveNodeNotificationService } from './services/inactiveNodeNotificationService.js';
-import { getUserNotificationPreferences, saveUserNotificationPreferences } from './utils/notificationFiltering.js';
+import { serverEventNotificationService } from './services/serverEventNotificationService.js';
+import { getUserNotificationPreferences, saveUserNotificationPreferences, applyNodeNamePrefix } from './utils/notificationFiltering.js';
 import { upgradeService } from './services/upgradeService.js';
 
 const require = createRequire(import.meta.url);
@@ -3470,9 +3471,8 @@ apiRouter.post('/settings/traceroute-interval', requirePermission('settings', 'w
 // Get auto-traceroute node filter settings
 apiRouter.get('/settings/traceroute-nodes', requirePermission('settings', 'read'), (_req, res) => {
   try {
-    const enabled = databaseService.isAutoTracerouteNodeFilterEnabled();
-    const nodeNums = databaseService.getAutoTracerouteNodes();
-    res.json({ enabled, nodeNums });
+    const settings = databaseService.getTracerouteFilterSettings();
+    res.json(settings);
   } catch (error) {
     logger.error('Error fetching auto-traceroute node filter:', error);
     res.status(500).json({ error: 'Failed to fetch auto-traceroute node filter' });
@@ -3482,7 +3482,10 @@ apiRouter.get('/settings/traceroute-nodes', requirePermission('settings', 'read'
 // Update auto-traceroute node filter settings
 apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'write'), (req, res) => {
   try {
-    const { enabled, nodeNums } = req.body;
+    const {
+      enabled, nodeNums, filterChannels, filterRoles, filterHwModels, filterNameRegex,
+      filterNodesEnabled, filterChannelsEnabled, filterRolesEnabled, filterHwModelsEnabled, filterRegexEnabled
+    } = req.body;
 
     // Validate input
     if (typeof enabled !== 'boolean') {
@@ -3500,11 +3503,92 @@ apiRouter.post('/settings/traceroute-nodes', requirePermission('settings', 'writ
       }
     }
 
-    // Update settings
-    databaseService.setAutoTracerouteNodeFilterEnabled(enabled);
-    databaseService.setAutoTracerouteNodes(nodeNums);
+    // Validate optional filter arrays
+    const validateIntArray = (arr: unknown, name: string): number[] => {
+      if (arr === undefined || arr === null) return [];
+      if (!Array.isArray(arr)) {
+        throw new Error(`Invalid ${name} value. Must be an array.`);
+      }
+      for (const item of arr) {
+        if (!Number.isInteger(item) || item < 0) {
+          throw new Error(`All ${name} values must be non-negative integers.`);
+        }
+      }
+      return arr as number[];
+    };
 
-    res.json({ success: true, enabled, nodeNums });
+    let validatedChannels: number[];
+    let validatedRoles: number[];
+    let validatedHwModels: number[];
+    try {
+      validatedChannels = validateIntArray(filterChannels, 'filterChannels');
+      validatedRoles = validateIntArray(filterRoles, 'filterRoles');
+      validatedHwModels = validateIntArray(filterHwModels, 'filterHwModels');
+    } catch (error) {
+      return res.status(400).json({ error: (error as Error).message });
+    }
+
+    // Validate regex if provided
+    let validatedRegex = '.*';
+    if (filterNameRegex !== undefined && filterNameRegex !== null) {
+      if (typeof filterNameRegex !== 'string') {
+        return res.status(400).json({ error: 'Invalid filterNameRegex value. Must be a string.' });
+      }
+      // Test that regex is valid
+      try {
+        new RegExp(filterNameRegex);
+        validatedRegex = filterNameRegex;
+      } catch {
+        return res.status(400).json({ error: 'Invalid filterNameRegex value. Must be a valid regular expression.' });
+      }
+    }
+
+    // Validate individual filter enabled flags (optional booleans, default to true)
+    const validateOptionalBoolean = (value: unknown, name: string): boolean | undefined => {
+      if (value === undefined) return undefined;
+      if (typeof value !== 'boolean') {
+        throw new Error(`Invalid ${name} value. Must be a boolean.`);
+      }
+      return value;
+    };
+
+    let validatedFilterNodesEnabled: boolean | undefined;
+    let validatedFilterChannelsEnabled: boolean | undefined;
+    let validatedFilterRolesEnabled: boolean | undefined;
+    let validatedFilterHwModelsEnabled: boolean | undefined;
+    let validatedFilterRegexEnabled: boolean | undefined;
+    try {
+      validatedFilterNodesEnabled = validateOptionalBoolean(filterNodesEnabled, 'filterNodesEnabled');
+      validatedFilterChannelsEnabled = validateOptionalBoolean(filterChannelsEnabled, 'filterChannelsEnabled');
+      validatedFilterRolesEnabled = validateOptionalBoolean(filterRolesEnabled, 'filterRolesEnabled');
+      validatedFilterHwModelsEnabled = validateOptionalBoolean(filterHwModelsEnabled, 'filterHwModelsEnabled');
+      validatedFilterRegexEnabled = validateOptionalBoolean(filterRegexEnabled, 'filterRegexEnabled');
+    } catch (error) {
+      return res.status(400).json({ error: (error as Error).message });
+    }
+
+    // Update all settings
+    databaseService.setTracerouteFilterSettings({
+      enabled,
+      nodeNums,
+      filterChannels: validatedChannels,
+      filterRoles: validatedRoles,
+      filterHwModels: validatedHwModels,
+      filterNameRegex: validatedRegex,
+      filterNodesEnabled: validatedFilterNodesEnabled,
+      filterChannelsEnabled: validatedFilterChannelsEnabled,
+      filterRolesEnabled: validatedFilterRolesEnabled,
+      filterHwModelsEnabled: validatedFilterHwModelsEnabled,
+      filterRegexEnabled: validatedFilterRegexEnabled,
+    });
+
+    // Get the updated settings to return (includes resolved default values)
+    const updatedSettings = databaseService.getTracerouteFilterSettings();
+
+    res.json({
+      success: true,
+      ...updatedSettings,
+    });
   } catch (error) {
     logger.error('Error updating auto-traceroute node filter:', error);
     res.status(500).json({ error: 'Failed to update auto-traceroute node filter' });
@@ -4286,6 +4370,17 @@ apiRouter.post('/config/device', requirePermission('configuration', 'write'), as
   }
 });
 
+apiRouter.post('/config/network', requirePermission('configuration', 'write'), async (req, res) => {
+  try {
+    const config = req.body;
+    await meshtasticManager.setNetworkConfig(config);
+    res.json({ success: true, message: 'Network configuration sent' });
+  } catch (error) {
+    logger.error('Error setting network config:', error);
+    res.status(500).json({ error: 'Failed to set network configuration' });
+  }
+});
+
 apiRouter.post('/config/lora', requirePermission('configuration', 'write'), async (req, res) => {
   try {
     const config = req.body;
@@ -4418,21 +4513,45 @@ apiRouter.post('/admin/load-config', requireAdmin(), async (req, res) => {
         // Local node - use existing config or request it
         let currentConfig = meshtasticManager.getCurrentConfig();
         
-        if (!currentConfig || (!currentConfig.deviceConfig && !currentConfig.moduleConfig)) {
-          // Try to request the config
-          logger.info('Config not available, requesting from device...');
+        // Map config types to their numeric values (same as remote node mapping)
+        const configTypeMap: { [key: string]: { type: number; isModule: boolean } } = {
+          'device': { type: 0, isModule: false },  // DEVICE_CONFIG
+          'lora': { type: 5, isModule: false },      // LORA_CONFIG
+          'position': { type: 6, isModule: false }, // POSITION_CONFIG
+          'mqtt': { type: 0, isModule: true }        // MQTT_CONFIG (module)
+        };
+
+        const configInfo = configTypeMap[configType];
+        if (!configInfo && configType !== 'channel') {
+          return res.status(400).json({ error: `Unknown config type: ${configType}` });
+        }
+
+        // Check if we need to request the specific config type
+        let needsRequest = false;
+        if (configType === 'device' && !currentConfig?.deviceConfig?.device) needsRequest = true;
+        if (configType === 'lora' && !currentConfig?.deviceConfig?.lora) needsRequest = true;
+        if (configType === 'position' && !currentConfig?.deviceConfig?.position) needsRequest = true;
+        if (configType === 'mqtt' && !currentConfig?.moduleConfig?.mqtt) needsRequest = true;
+        
+        if (needsRequest && configInfo) {
+          // Try to request the specific config type
+          logger.info(`Config type '${configType}' not available, requesting from device...`);
           try {
-            await meshtasticManager.requestConfig(5); // Request LoRa config (most common)
+            if (configInfo.isModule) {
+              await meshtasticManager.requestModuleConfig(configInfo.type);
+            } else {
+              await meshtasticManager.requestConfig(configInfo.type);
+            }
             // Wait a bit for response
             await new Promise(resolve => setTimeout(resolve, 1000));
           } catch (error) {
-            logger.warn('Failed to request config:', error);
+            logger.warn(`Failed to request ${configType} config:`, error);
           }
           
           // Check again
           const retryConfig = meshtasticManager.getCurrentConfig();
-          if (!retryConfig || (!retryConfig.deviceConfig && !retryConfig.moduleConfig)) {
-            return res.status(404).json({ error: 'Device configuration not yet loaded. Please ensure the device is connected and try again in a few seconds.' });
+          if (!retryConfig) {
+            return res.status(404).json({ error: `Device configuration not yet loaded. Please ensure the device is connected and try again in a few seconds.` });
           }
           // Use the retried config
           currentConfig = retryConfig;
@@ -5638,9 +5757,17 @@ apiRouter.post('/push/test', requireAdmin(), async (req, res) => {
   try {
     const userId = req.session?.userId;
 
+    // Get local node name for prefix
+    const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+    const localNodeName = localNodeInfo?.longName || null;
+
+    // Apply prefix if user has it enabled
+    const baseBody = 'This is a test push notification from MeshMonitor';
+    const body = applyNodeNamePrefix(userId, baseBody, localNodeName);
+
     const result = await pushNotificationService.sendToUser(userId, {
       title: 'Test Notification',
-      body: 'This is a test push notification from MeshMonitor',
+      body,
       icon: '/logo.png',
       badge: '/logo.png',
       tag: 'test-notification',
@@ -5677,12 +5804,14 @@ apiRouter.get('/push/preferences', requireAuth(), async (req, res) => {
         enabledChannels: [],
         enableDirectMessages: true,
         notifyOnEmoji: true,
+        notifyOnMqtt: true,
         notifyOnNewNode: true,
         notifyOnTraceroute: true,
         notifyOnInactiveNode: false,
         monitoredNodes: [],
         whitelist: ['Hi', 'Help'],
         blacklist: ['Test', 'Copy'],
+        appriseUrls: [],
       });
     }
   } catch (error: any) {
@@ -5705,12 +5834,16 @@ apiRouter.post('/push/preferences', requireAuth(), async (req, res) => {
       enabledChannels,
       enableDirectMessages,
       notifyOnEmoji,
+      notifyOnMqtt,
       notifyOnNewNode,
       notifyOnTraceroute,
       notifyOnInactiveNode,
+      notifyOnServerEvents,
+      prefixWithNodeName,
       monitoredNodes,
       whitelist,
       blacklist,
+      appriseUrls,
     } = req.body;
 
     // Validate input
@@ -5739,18 +5872,30 @@ apiRouter.post('/push/preferences', requireAuth(), async (req, res) => {
       return res.status(400).json({ error: 'monitoredNodes must be an array of strings' });
     }
 
+    // Validate appriseUrls is an array of strings if provided
+    if (appriseUrls !== undefined && !Array.isArray(appriseUrls)) {
+      return res.status(400).json({ error: 'appriseUrls must be an array' });
+    }
+    if (appriseUrls && appriseUrls.some((url: any) => typeof url !== 'string')) {
+      return res.status(400).json({ error: 'appriseUrls must be an array of strings' });
+    }
+
     const prefs = {
       enableWebPush,
       enableApprise,
       enabledChannels,
       enableDirectMessages,
       notifyOnEmoji,
+      notifyOnMqtt: notifyOnMqtt ?? true,
       notifyOnNewNode,
       notifyOnTraceroute,
       notifyOnInactiveNode: notifyOnInactiveNode ?? false,
+      notifyOnServerEvents: notifyOnServerEvents ?? false,
+      prefixWithNodeName: prefixWithNodeName ?? false,
       monitoredNodes: monitoredNodes ?? [],
       whitelist,
       blacklist,
+      appriseUrls: appriseUrls ?? [],
     };
 
     const success = saveUserNotificationPreferences(userId, prefs);
@@ -5789,11 +5934,21 @@ apiRouter.get('/apprise/status', requireAdmin(), async (_req, res) => {
 });
 
 // Send test Apprise notification (admin only)
-apiRouter.post('/apprise/test', requireAdmin(), async (_req, res) => {
+apiRouter.post('/apprise/test', requireAdmin(), async (req, res) => {
   try {
+    const userId = req.session?.userId;
+
+    // Get local node name for prefix
+    const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+    const localNodeName = localNodeInfo?.longName || null;
+
+    // Apply prefix if user has it enabled
+    const baseBody = 'This is a test notification from MeshMonitor via Apprise';
+    const body = applyNodeNamePrefix(userId, baseBody, localNodeName);
+
     const success = await appriseNotificationService.sendNotification({
       title: 'Test Notification',
-      body: 'This is a test notification from MeshMonitor via Apprise',
+      body,
       type: 'info',
     });
 
@@ -6802,6 +6957,19 @@ migrateAutoResponderTriggers();
 const server = app.listen(PORT, () => {
   logger.debug(`MeshMonitor server running on port ${PORT}`);
   logger.debug(`Environment: ${env.nodeEnv}`);
+
+  // Send server start notification
+  const enabledFeatures: string[] = [];
+  if (env.oidcEnabled) enabledFeatures.push('OIDC');
+  if (env.enableVirtualNode) enabledFeatures.push('Virtual Node');
+  if (env.accessLogEnabled) enabledFeatures.push('Access Logging');
+  if (pushNotificationService.isAvailable()) enabledFeatures.push('Web Push');
+  if (appriseNotificationService.isAvailable()) enabledFeatures.push('Apprise');
+
+  serverEventNotificationService.notifyServerStart({
+    version: packageJson.version,
+    features: enabledFeatures,
+  });
 
   // Log environment variable sources in development
   if (env.isDevelopment) {

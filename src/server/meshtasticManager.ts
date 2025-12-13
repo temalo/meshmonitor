@@ -8,6 +8,7 @@ import { formatTime, formatDate } from '../utils/datetime.js';
 import { logger } from '../utils/logger.js';
 import { getEnvironmentConfig } from './config/environment.js';
 import { notificationService } from './services/notificationService.js';
+import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import packetLogService from './services/packetLogService.js';
 import { messageQueueService } from './messageQueueService.js';
 import { normalizeTriggerPatterns } from '../utils/autoResponderUtils.js';
@@ -111,6 +112,9 @@ class MeshtasticManager {
   private remoteNodeOwners: Map<number, any> = new Map();
   private favoritesSupportCache: boolean | null = null;  // Cache firmware support check result
   private cachedAutoAckRegex: { pattern: string; regex: RegExp } | null = null;  // Cached compiled regex
+
+  // Auto-welcome tracking to prevent race conditions
+  private welcomingNodes: Set<number> = new Set();  // Track nodes currently being welcomed
 
   // Virtual Node Server - Message capture for initialization sequence
   private initConfigCache: Array<{ type: string; data: Uint8Array }> = [];  // Store raw FromRadio messages with type metadata during init
@@ -219,10 +223,13 @@ class MeshtasticManager {
   }
 
   private async handleConnected(): Promise<void> {
-    logger.debug('✅ TCP connection established, requesting configuration...');
+    logger.debug('TCP connection established, requesting configuration...');
     this.isConnected = true;
     // Clear localNodeInfo so node will be marked as not responsive until it sends MyNodeInfo
     this.localNodeInfo = null;
+
+    // Notify server event service of connection (handles initial vs reconnect logic)
+    serverEventNotificationService.notifyNodeConnected();
 
     try {
       // Enable message capture for virtual node server
@@ -289,19 +296,22 @@ class MeshtasticManager {
   }
 
   private handleDisconnected(): void {
-    logger.debug('🔌 TCP connection lost');
+    logger.debug('TCP connection lost');
     this.isConnected = false;
     // Clear localNodeInfo so node will be marked as not responsive
     this.localNodeInfo = null;
     // Clear favorites support cache on disconnect
     this.favoritesSupportCache = null;
 
+    // Notify server event service of disconnection
+    serverEventNotificationService.notifyNodeDisconnected();
+
     // Only auto-reconnect if not in user-disconnected state
     if (this.userDisconnectedState) {
-      logger.debug('⏸️  User-initiated disconnect active, skipping auto-reconnect');
+      logger.debug('User-initiated disconnect active, skipping auto-reconnect');
     } else {
       // Transport will handle automatic reconnection
-      logger.debug('🔄 Auto-reconnection will be attempted by transport');
+      logger.debug('Auto-reconnection will be attempted by transport');
     }
   }
 
@@ -1298,13 +1308,15 @@ class MeshtasticManager {
         const portnum = meshPacket.decoded?.portnum ?? 0;
         const portnumName = meshtasticProtobufService.getPortNumName(portnum);
 
-        // Generate payload preview
+        // Generate payload preview and store decoded payload
         let payloadPreview = null;
+        let decodedPayload: any = null;
         if (isEncrypted) {
           payloadPreview = '🔒 <ENCRYPTED>';
         } else if (meshPacket.decoded?.payload) {
           try {
-            const processedPayload = meshtasticProtobufService.processPayload(portnum, meshPacket.decoded.payload);
+            decodedPayload = meshtasticProtobufService.processPayload(portnum, meshPacket.decoded.payload);
+            const processedPayload = decodedPayload;
             if (portnum === 1 && typeof processedPayload === 'string') {
               // TEXT_MESSAGE - show first 100 chars
               payloadPreview = processedPayload.substring(0, 100);
@@ -1350,6 +1362,10 @@ class MeshtasticManager {
                 telemetryType = 'Host';
               }
               payloadPreview = `[Telemetry: ${telemetryType}]`;
+            } else if (portnum === 34) {
+              // PAXCOUNTER - show WiFi and BLE counts
+              const pax = processedPayload as any;
+              payloadPreview = `[Paxcounter: WiFi=${pax.wifi || 0}, BLE=${pax.ble || 0}]`;
             } else if (portnum === 70) {
               // TRACEROUTE
               payloadPreview = '[Traceroute]';
@@ -1381,6 +1397,11 @@ class MeshtasticManager {
         if (isEncrypted && meshPacket.encrypted) {
           // Convert Uint8Array to hex string for storage
           metadata.encrypted_payload = Buffer.from(meshPacket.encrypted).toString('hex');
+        }
+
+        // Include decoded payload for non-encrypted packets
+        if (decodedPayload !== null) {
+          metadata.decoded_payload = decodedPayload;
         }
 
         packetLogService.logPacket({
@@ -1463,6 +1484,9 @@ class MeshtasticManager {
             break;
           case 4: // NODEINFO_APP
             await this.processNodeInfoMessageProtobuf(meshPacket, processedPayload as any);
+            break;
+          case 34: // PAXCOUNTER_APP
+            await this.processPaxcounterMessageProtobuf(meshPacket, processedPayload as any);
             break;
           case 67: // TELEMETRY_APP
             await this.processTelemetryMessageProtobuf(meshPacket, processedPayload as any);
@@ -1583,6 +1607,7 @@ class MeshtasticManager {
           hopLimit: hopLimit,
           replyId: replyId && replyId > 0 ? replyId : undefined,
           emoji: emoji,
+          viaMqtt: meshPacket.viaMqtt === true, // Capture whether message was received via MQTT bridge
           requestId: context?.virtualNodeRequestId, // For Virtual Node messages, preserve packet ID for ACK matching
           wantAck: context?.virtualNodeRequestId ? 1 : undefined, // Expect ACK for Virtual Node messages
           deliveryState: context?.virtualNodeRequestId ? 'pending' : undefined, // Track delivery for Virtual Node messages
@@ -2109,6 +2134,66 @@ class MeshtasticManager {
       logger.debug(`📊 Updated node telemetry and saved to telemetry table: ${nodeId}`);
     } catch (error) {
       logger.error('❌ Error processing telemetry message:', error);
+    }
+  }
+
+  /**
+   * Process paxcounter message
+   * Paxcounter counts nearby WiFi and BLE devices
+   */
+  private async processPaxcounterMessageProtobuf(meshPacket: any, paxcount: any): Promise<void> {
+    try {
+      logger.debug('📊 Processing paxcounter message');
+
+      const fromNum = Number(meshPacket.from);
+      const nodeId = `!${fromNum.toString(16).padStart(8, '0')}`;
+      // Use server receive time instead of packet time to avoid issues with nodes having incorrect time offsets
+      const now = Date.now();
+      const timestamp = now;
+
+      // Track PKI encryption
+      this.trackPKIEncryption(meshPacket, fromNum);
+
+      const nodeData: any = {
+        nodeNum: fromNum,
+        nodeId: nodeId,
+        lastHeard: meshPacket.rxTime ? Number(meshPacket.rxTime) : Date.now() / 1000
+      };
+
+      // Only include SNR/RSSI if they have valid values
+      if (meshPacket.rxSnr && meshPacket.rxSnr !== 0) {
+        nodeData.snr = meshPacket.rxSnr;
+      }
+      if (meshPacket.rxRssi && meshPacket.rxRssi !== 0) {
+        nodeData.rssi = meshPacket.rxRssi;
+      }
+
+      logger.debug(`📡 Paxcounter: wifi=${paxcount.wifi}, ble=${paxcount.ble}, uptime=${paxcount.uptime}`);
+
+      // Save paxcounter metrics as telemetry
+      if (paxcount.wifi !== undefined && paxcount.wifi !== null && !isNaN(paxcount.wifi)) {
+        databaseService.insertTelemetry({
+          nodeId, nodeNum: fromNum, telemetryType: 'paxcounterWifi',
+          timestamp, value: paxcount.wifi, unit: 'devices', createdAt: now
+        });
+      }
+      if (paxcount.ble !== undefined && paxcount.ble !== null && !isNaN(paxcount.ble)) {
+        databaseService.insertTelemetry({
+          nodeId, nodeNum: fromNum, telemetryType: 'paxcounterBle',
+          timestamp, value: paxcount.ble, unit: 'devices', createdAt: now
+        });
+      }
+      if (paxcount.uptime !== undefined && paxcount.uptime !== null && !isNaN(paxcount.uptime)) {
+        databaseService.insertTelemetry({
+          nodeId, nodeNum: fromNum, telemetryType: 'paxcounterUptime',
+          timestamp, value: paxcount.uptime, unit: 's', createdAt: now
+        });
+      }
+
+      databaseService.upsertNode(nodeData);
+      logger.debug(`📡 Updated node with paxcounter data: ${nodeId}`);
+    } catch (error) {
+      logger.error('❌ Error processing paxcounter message:', error);
     }
   }
 
@@ -4524,7 +4609,8 @@ class MeshtasticManager {
       }, {
         messageText,
         channelId: message.channel,
-        isDirectMessage
+        isDirectMessage,
+        viaMqtt: message.viaMqtt === true
       });
 
       logger.debug(
@@ -4647,7 +4733,8 @@ class MeshtasticManager {
         : `channel ${channelIndex}`;
 
       // Send tapback with hop count emoji if enabled
-      if (autoAckTapbackEnabled && packetId) {
+      // Note: packetId can be 0 (valid unsigned integer), so check for null/undefined explicitly
+      if (autoAckTapbackEnabled && packetId != null) {
         // Hop count emojis: *️⃣ for 0 (direct), 1️⃣-7️⃣ for 1-7+ hops
         const HOP_COUNT_EMOJIS = ['*️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣'];
         const hopEmojiIndex = Math.min(hopsTraveled, 7); // Cap at 7 for 7+ hops
@@ -5391,6 +5478,12 @@ class MeshtasticManager {
         return;
       }
 
+      // RACE CONDITION PROTECTION: Check if we're already welcoming this node
+      if (this.welcomingNodes.has(nodeNum)) {
+        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already being welcomed in parallel`);
+        return;
+      }
+
       // Check if we've already welcomed this node
       const node = databaseService.getNode(nodeNum);
       if (!node) {
@@ -5401,10 +5494,12 @@ class MeshtasticManager {
       // Skip if node has already been welcomed (nodes should only be welcomed once)
       // Use explicit null/undefined check to handle edge case where welcomedAt might be 0
       if (node.welcomedAt !== null && node.welcomedAt !== undefined) {
-        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already welcomed previously`);
+        logger.debug(`⏭️  Skipping auto-welcome for ${nodeId} - already welcomed at ${new Date(node.welcomedAt).toISOString()}`);
         return;
       }
 
+      // Check all conditions BEFORE acquiring the lock
+      // This allows subsequent calls to re-evaluate conditions if they change
       // Check if we should wait for name
       const autoWelcomeWaitForName = databaseService.getSetting('autoWelcomeWaitForName');
       if (autoWelcomeWaitForName === 'true') {
@@ -5427,39 +5522,59 @@ class MeshtasticManager {
         return;
       }
 
-      // Get welcome message template
-      const autoWelcomeMessage = databaseService.getSetting('autoWelcomeMessage') || 'Welcome {LONG_NAME} ({SHORT_NAME}) to the mesh!';
+      // RACE CONDITION PROTECTION: Mark that we're welcoming this node
+      // This prevents duplicate welcomes if multiple packets arrive before database is updated
+      // Lock is added AFTER all conditions are satisfied to allow re-evaluation on subsequent calls
+      this.welcomingNodes.add(nodeNum);
+      logger.debug(`🔒 Locked auto-welcome for ${nodeId} to prevent duplicates`);
 
-      // Replace tokens in the message template
-      const welcomeText = await this.replaceWelcomeTokens(autoWelcomeMessage, nodeNum, nodeId);
+      try {
 
-      // Get target (DM or channel)
-      const autoWelcomeTarget = databaseService.getSetting('autoWelcomeTarget') || '0';
+        // Get welcome message template
+        const autoWelcomeMessage = databaseService.getSetting('autoWelcomeMessage') || 'Welcome {LONG_NAME} ({SHORT_NAME}) to the mesh!';
 
-      let destination: number | undefined;
-      let channel: number;
+        // Replace tokens in the message template
+        const welcomeText = await this.replaceWelcomeTokens(autoWelcomeMessage, nodeNum, nodeId);
 
-      if (autoWelcomeTarget === 'dm') {
-        // Send as direct message
-        destination = nodeNum;
-        channel = 0;
-      } else {
-        // Send to channel
-        destination = undefined;
-        channel = parseInt(autoWelcomeTarget);
+        // Get target (DM or channel)
+        const autoWelcomeTarget = databaseService.getSetting('autoWelcomeTarget') || '0';
+
+        let destination: number | undefined;
+        let channel: number;
+
+        if (autoWelcomeTarget === 'dm') {
+          // Send as direct message
+          destination = nodeNum;
+          channel = 0;
+        } else {
+          // Send to channel
+          destination = undefined;
+          channel = parseInt(autoWelcomeTarget);
+        }
+
+        logger.info(`👋 Sending auto-welcome to ${nodeId} (${node.longName}): "${welcomeText}" ${autoWelcomeTarget === 'dm' ? '(via DM)' : `(channel ${channel})`}`);
+
+        await this.sendTextMessage(welcomeText, channel, destination);
+
+        // Mark node as welcomed using atomic check-and-set operation
+        // This ensures the node is only marked if it hasn't been marked already
+        const wasMarked = databaseService.markNodeAsWelcomedIfNotAlready(nodeNum, nodeId);
+        if (wasMarked) {
+          logger.info(`✅ Node ${nodeId} welcomed successfully and marked in database`);
+        } else {
+          logger.warn(`⚠️  Node ${nodeId} was already marked as welcomed by another process`);
+        }
+
+        // RACE CONDITION PROTECTION: Release lock immediately after atomic database operation
+        // The atomic operation completes synchronously, so no delay is needed
+        this.welcomingNodes.delete(nodeNum);
+        logger.debug(`🔓 Unlocked auto-welcome tracking for ${nodeId}`);
+      } catch (error) {
+        // Release lock on error as well
+        this.welcomingNodes.delete(nodeNum);
+        logger.debug(`🔓 Unlocked auto-welcome tracking for ${nodeId} (error case)`);
+        throw error;
       }
-
-      logger.info(`👋 Sending auto-welcome to ${nodeId} (${node.longName}): "${welcomeText}" ${autoWelcomeTarget === 'dm' ? '(via DM)' : `(channel ${channel})`}`);
-
-      await this.sendTextMessage(welcomeText, channel, destination);
-
-      // Mark node as welcomed
-      databaseService.upsertNode({
-        nodeNum: nodeNum,
-        nodeId: nodeId,
-        welcomedAt: Date.now()
-      });
-      logger.debug(`✅ Marked ${nodeId} as welcomed`);
     } catch (error) {
       logger.error('❌ Error in auto-welcome:', error);
     }
@@ -6769,6 +6884,27 @@ class MeshtasticManager {
   }
 
   /**
+   * Set network configuration (NTP server, etc.)
+   */
+  async setNetworkConfig(config: any): Promise<void> {
+    if (!this.isConnected || !this.transport) {
+      throw new Error('Not connected to Meshtastic node');
+    }
+
+    try {
+      logger.debug('⚙️ Sending network config:', JSON.stringify(config));
+      const setConfigMsg = protobufService.createSetNetworkConfigMessage(config, new Uint8Array());
+      const adminPacket = protobufService.createAdminPacket(setConfigMsg, this.localNodeInfo?.nodeNum || 0, this.localNodeInfo?.nodeNum);
+
+      await this.transport.send(adminPacket);
+      logger.debug('⚙️ Sent set_network_config admin message');
+    } catch (error) {
+      logger.error('❌ Error sending network config:', error);
+      throw error;
+    }
+  }
+
+  /**
    * Set channel configuration
    * @param channelIndex The channel index (0-7)
    * @param config Channel configuration
@@ -7079,6 +7215,7 @@ class MeshtasticManager {
       hopLimit: msg.hopLimit,
       replyId: msg.replyId,
       emoji: msg.emoji,
+      viaMqtt: Boolean(msg.viaMqtt),
       // Include delivery tracking fields
       requestId: (msg as any).requestId,
       wantAck: Boolean((msg as any).wantAck),
@@ -7115,6 +7252,10 @@ class MeshtasticManager {
   async userDisconnect(): Promise<void> {
     logger.debug('🔌 User-initiated disconnect requested');
     this.userDisconnectedState = true;
+
+    // Notify about disconnect before actually disconnecting
+    // This ensures users get notified even for user-initiated disconnects
+    serverEventNotificationService.notifyNodeDisconnected();
 
     if (this.transport) {
       try {

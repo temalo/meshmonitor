@@ -2,6 +2,7 @@ import { Server, Socket } from 'net';
 import { EventEmitter } from 'events';
 import { logger } from '../utils/logger.js';
 import meshtasticProtobufService from './meshtasticProtobufService.js';
+import protobufService from './protobufService.js';
 import { MeshtasticManager } from './meshtasticManager.js';
 import databaseService from '../services/database.js';
 
@@ -341,19 +342,80 @@ export class VirtualNodeServer extends EventEmitter {
             logger.debug(`Virtual node: Allowing self-addressed admin command from ${clientId} (portnum ${normalizedPortNum}/${meshtasticProtobufService.getPortNumName(normalizedPortNum)})`);
             // Allow this message to be queued and forwarded
           } else {
-            // Block admin commands to other devices
-            logger.warn(`Virtual node: Blocked admin command from ${clientId} (portnum ${normalizedPortNum}/${meshtasticProtobufService.getPortNumName(normalizedPortNum)})`);
-            logger.warn(`Virtual node: Blocked packet details:`, JSON.stringify({
-              from: toRadio.packet.from,
-              to: toRadio.packet.to,
-              wantAck: toRadio.packet.wantAck,
-              portnum: normalizedPortNum,
-              portnumName: meshtasticProtobufService.getPortNumName(normalizedPortNum),
-              originalPortnum: portnum,
-              decoded: toRadio.packet.decoded,
-            }, null, 2));
-            // Silently drop the message
-            return;
+            // Check if this is a favorite/unfavorite command - these should be intercepted
+            // and processed locally to update the database (fixes #1000)
+            const adminPayload = toRadio.packet.decoded?.payload;
+            if (adminPayload && normalizedPortNum === 6) { // ADMIN_APP
+              try {
+                const adminMsg = protobufService.decodeAdminMessage(
+                  adminPayload instanceof Uint8Array ? adminPayload : new Uint8Array(adminPayload)
+                );
+
+                if (adminMsg) {
+                  // Handle setFavoriteNode
+                  if (adminMsg.setFavoriteNode !== undefined && adminMsg.setFavoriteNode !== null) {
+                    const targetNodeNum = Number(adminMsg.setFavoriteNode);
+                    logger.info(`⭐ Virtual node: Intercepted setFavoriteNode for node ${targetNodeNum} from ${clientId}`);
+
+                    // Update database
+                    databaseService.setNodeFavorite(targetNodeNum, true);
+                    logger.debug(`✅ Virtual node: Updated database - node ${targetNodeNum} is now favorite`);
+
+                    // Don't block - let the command through to the physical node
+                    // Continue to queueMessage below
+                  }
+                  // Handle removeFavoriteNode
+                  else if (adminMsg.removeFavoriteNode !== undefined && adminMsg.removeFavoriteNode !== null) {
+                    const targetNodeNum = Number(adminMsg.removeFavoriteNode);
+                    logger.info(`☆ Virtual node: Intercepted removeFavoriteNode for node ${targetNodeNum} from ${clientId}`);
+
+                    // Update database
+                    databaseService.setNodeFavorite(targetNodeNum, false);
+                    logger.debug(`✅ Virtual node: Updated database - node ${targetNodeNum} is no longer favorite`);
+
+                    // Don't block - let the command through to the physical node
+                    // Continue to queueMessage below
+                  }
+                  else {
+                    // Other admin commands - block them
+                    logger.warn(`Virtual node: Blocked admin command from ${clientId} (portnum ${normalizedPortNum}/${meshtasticProtobufService.getPortNumName(normalizedPortNum)})`);
+                    logger.warn(`Virtual node: Blocked packet details:`, JSON.stringify({
+                      from: toRadio.packet.from,
+                      to: toRadio.packet.to,
+                      wantAck: toRadio.packet.wantAck,
+                      portnum: normalizedPortNum,
+                      portnumName: meshtasticProtobufService.getPortNumName(normalizedPortNum),
+                      originalPortnum: portnum,
+                      decoded: toRadio.packet.decoded,
+                    }, null, 2));
+                    // Silently drop the message
+                    return;
+                  }
+                } else {
+                  // Couldn't decode admin message - block it to be safe
+                  logger.warn(`Virtual node: Blocked undecodable admin command from ${clientId}`);
+                  return;
+                }
+              } catch (decodeError) {
+                // Failed to decode admin message - block it to be safe
+                logger.warn(`Virtual node: Failed to decode admin message from ${clientId}, blocking:`, decodeError);
+                return;
+              }
+            } else {
+              // Non-admin blocked portnum (like NODEINFO_APP) - block it
+              logger.warn(`Virtual node: Blocked admin command from ${clientId} (portnum ${normalizedPortNum}/${meshtasticProtobufService.getPortNumName(normalizedPortNum)})`);
+              logger.warn(`Virtual node: Blocked packet details:`, JSON.stringify({
+                from: toRadio.packet.from,
+                to: toRadio.packet.to,
+                wantAck: toRadio.packet.wantAck,
+                portnum: normalizedPortNum,
+                portnumName: meshtasticProtobufService.getPortNumName(normalizedPortNum),
+                originalPortnum: portnum,
+                decoded: toRadio.packet.decoded,
+              }, null, 2));
+              // Silently drop the message
+              return;
+            }
           }
         } else if (this.allowAdminCommands && normalizedPortNum && this.BLOCKED_PORTNUMS.includes(normalizedPortNum)) {
           // Admin commands are explicitly allowed via configuration
@@ -408,9 +470,20 @@ export class VirtualNodeServer extends EventEmitter {
         // Client is requesting config with a specific ID
         logger.info(`Virtual node: Client ${clientId} requesting config with ID ${toRadio.wantConfigId}`);
         await this.sendInitialConfig(clientId, toRadio.wantConfigId);
+      } else if (toRadio.heartbeat) {
+        // Handle heartbeat locally - don't forward to physical node
+        // Heartbeats are just keep-alive signals between client and VNS
+        logger.debug(`Virtual node: Received heartbeat from ${clientId}, handling locally`);
+        // No response needed for heartbeat - it just keeps the connection alive
+      } else if (toRadio.disconnect) {
+        // Handle disconnect request locally - don't forward to physical node
+        logger.info(`Virtual node: Client ${clientId} requested disconnect`);
+        // The socket close will be handled by the 'close' event handler
       } else {
-        // Forward other message types (heartbeats, etc.) to physical node
-        logger.info(`Virtual node: Forwarding other message type from ${clientId} to physical node`);
+        // Forward other message types to physical node only if they require it
+        // Log the message type for debugging
+        const messageType = Object.keys(toRadio).filter(k => k !== 'payloadVariant' && toRadio[k as keyof typeof toRadio] !== undefined);
+        logger.info(`Virtual node: Forwarding message type [${messageType.join(', ')}] from ${clientId} to physical node`);
         this.queueMessage(clientId, payload);
       }
     } catch (error) {

@@ -36,6 +36,10 @@ import { migration as apiTokensMigration } from '../server/migrations/025_add_ap
 import { migration as cascadeForeignKeysMigration } from '../server/migrations/028_add_cascade_to_foreign_keys.js';
 import { migration as userMapPreferencesMigration } from '../server/migrations/030_add_user_map_preferences.js';
 import { migration as isIgnoredMigration } from '../server/migrations/033_add_is_ignored_to_nodes.js';
+import { migration as notifyOnServerEventsMigration } from '../server/migrations/034_add_notify_on_server_events.js';
+import { migration as prefixWithNodeNameMigration } from '../server/migrations/035_add_prefix_with_node_name.js';
+import { migration as perUserAppriseUrlsMigration } from '../server/migrations/036_add_per_user_apprise_urls.js';
+import { migration as notifyOnMqttMigration } from '../server/migrations/037_add_notify_on_mqtt.js';
 import { validateThemeDefinition as validateTheme } from '../utils/themeValidation.js';
 
 // Configuration constants for traceroute history
@@ -102,6 +106,7 @@ export interface DbMessage {
   hopLimit?: number;
   replyId?: number;
   emoji?: number;
+  viaMqtt?: boolean;
   createdAt: number;
 }
 
@@ -404,6 +409,10 @@ class DatabaseService {
     this.runUserMapPreferencesMigration();
     this.runInactiveNodeNotificationMigration();
     this.runIsIgnoredMigration();
+    this.runNotifyOnServerEventsMigration();
+    this.runPrefixWithNodeNameMigration();
+    this.runPerUserAppriseUrlsMigration();
+    this.runNotifyOnMqttMigration();
     this.ensureAutomationDefaults();
     this.isInitialized = true;
   }
@@ -1064,6 +1073,82 @@ class DatabaseService {
     }
   }
 
+  private runNotifyOnServerEventsMigration(): void {
+    const migrationKey = 'migration_034_notify_on_server_events';
+    try {
+      const currentStatus = this.getSetting(migrationKey);
+      if (currentStatus === 'completed') {
+        logger.debug('✅ Notify on server events migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 034: Add notify_on_server_events column...');
+      notifyOnServerEventsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Notify on server events migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run notify on server events migration:', error);
+      throw error;
+    }
+  }
+
+  private runPrefixWithNodeNameMigration(): void {
+    const migrationKey = 'migration_035_prefix_with_node_name';
+    try {
+      const currentStatus = this.getSetting(migrationKey);
+      if (currentStatus === 'completed') {
+        logger.debug('✅ Prefix with node name migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 035: Add prefix_with_node_name column...');
+      prefixWithNodeNameMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Prefix with node name migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run prefix with node name migration:', error);
+      throw error;
+    }
+  }
+
+  private runPerUserAppriseUrlsMigration(): void {
+    const migrationKey = 'migration_036_per_user_apprise_urls';
+    try {
+      const currentStatus = this.getSetting(migrationKey);
+      if (currentStatus === 'completed') {
+        logger.debug('✅ Per-user Apprise URLs migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 036: Add per-user apprise_urls column...');
+      perUserAppriseUrlsMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Per-user Apprise URLs migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run per-user Apprise URLs migration:', error);
+      throw error;
+    }
+  }
+
+  private runNotifyOnMqttMigration(): void {
+    const migrationKey = 'migration_037_notify_on_mqtt';
+    try {
+      const currentStatus = this.getSetting(migrationKey);
+      if (currentStatus === 'completed') {
+        logger.debug('✅ Notify on MQTT migration already completed');
+        return;
+      }
+
+      logger.debug('Running migration 037: Add notify_on_mqtt column...');
+      notifyOnMqttMigration.up(this.db);
+      this.setSetting(migrationKey, 'completed');
+      logger.debug('✅ Notify on MQTT migration completed successfully');
+    } catch (error) {
+      logger.error('❌ Failed to run notify on MQTT migration:', error);
+      throw error;
+    }
+  }
+
   private runInactiveNodeNotificationMigration(): void {
     logger.debug('Running inactive node notification migration...');
     try {
@@ -1443,6 +1528,18 @@ class DatabaseService {
       }
     }
 
+    // Add viaMqtt column to messages table for MQTT message filtering
+    try {
+      this.db.exec(`
+        ALTER TABLE messages ADD COLUMN viaMqtt BOOLEAN DEFAULT 0;
+      `);
+      logger.debug('✅ Added viaMqtt column to messages table');
+    } catch (error: any) {
+      if (!error.message?.includes('duplicate column')) {
+        logger.debug('⚠️ viaMqtt column on messages already exists or other error:', error.message);
+      }
+    }
+
     try {
       this.db.exec(`
         ALTER TABLE telemetry ADD COLUMN packetTimestamp INTEGER;
@@ -1819,6 +1916,22 @@ class DatabaseService {
   }
 
   /**
+   * Atomically mark a specific node as welcomed if not already welcomed.
+   * This prevents race conditions where multiple processes try to welcome the same node.
+   * Returns true if the node was marked, false if already welcomed.
+   */
+  markNodeAsWelcomedIfNotAlready(nodeNum: number, nodeId: string): boolean {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      UPDATE nodes
+      SET welcomedAt = ?, updatedAt = ?
+      WHERE nodeNum = ? AND nodeId = ? AND welcomedAt IS NULL
+    `);
+    const result = stmt.run(now, now, nodeNum, nodeId);
+    return result.changes > 0;
+  }
+
+  /**
    * Get nodes with key security issues (low-entropy or duplicate keys)
    */
   getNodesWithKeySecurityIssues(): DbNode[] {
@@ -1911,8 +2024,8 @@ class DatabaseService {
       INSERT OR IGNORE INTO messages (
         id, fromNodeNum, toNodeNum, fromNodeId, toNodeId,
         text, channel, portnum, timestamp, rxTime, hopStart, hopLimit, replyId, emoji,
-        requestId, ackFailed, routingErrorReceived, deliveryState, wantAck, createdAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        requestId, ackFailed, routingErrorReceived, deliveryState, wantAck, viaMqtt, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -1935,6 +2048,7 @@ class DatabaseService {
       (messageData as any).routingErrorReceived ?? 0,
       (messageData as any).deliveryState ?? null,
       (messageData as any).wantAck ?? 0,
+      messageData.viaMqtt ? 1 : 0,
       messageData.createdAt
     );
   }
@@ -2764,12 +2878,54 @@ class DatabaseService {
 
     // Check if node filter is enabled
     const filterEnabled = this.isAutoTracerouteNodeFilterEnabled();
-    const allowedNodes = filterEnabled ? this.getAutoTracerouteNodes() : [];
 
-    // Build the node filter clause
+    // Get all filter settings
+    const specificNodes = this.getAutoTracerouteNodes();
+    const filterChannels = this.getTracerouteFilterChannels();
+    const filterRoles = this.getTracerouteFilterRoles();
+    const filterHwModels = this.getTracerouteFilterHwModels();
+    const filterNameRegex = this.getTracerouteFilterNameRegex();
+
+    // Get individual filter enabled flags
+    const filterNodesEnabled = this.isTracerouteFilterNodesEnabled();
+    const filterChannelsEnabled = this.isTracerouteFilterChannelsEnabled();
+    const filterRolesEnabled = this.isTracerouteFilterRolesEnabled();
+    const filterHwModelsEnabled = this.isTracerouteFilterHwModelsEnabled();
+    const filterRegexEnabled = this.isTracerouteFilterRegexEnabled();
+
+    // Build the node filter clause using UNION logic
+    // Each filter ADDS nodes to the eligible set
     let nodeFilterClause = '';
-    if (filterEnabled && allowedNodes.length > 0) {
-      nodeFilterClause = `AND n.nodeNum IN (${allowedNodes.join(',')})`;
+    if (filterEnabled) {
+      const filterConditions: string[] = [];
+
+      // Add specific node numbers (only if this filter is enabled)
+      if (filterNodesEnabled && specificNodes.length > 0) {
+        filterConditions.push(`n.nodeNum IN (${specificNodes.join(',')})`);
+      }
+
+      // Add nodes matching channel filter (only if this filter is enabled)
+      if (filterChannelsEnabled && filterChannels.length > 0) {
+        filterConditions.push(`n.channel IN (${filterChannels.join(',')})`);
+      }
+
+      // Add nodes matching role filter (only if this filter is enabled)
+      if (filterRolesEnabled && filterRoles.length > 0) {
+        filterConditions.push(`n.role IN (${filterRoles.join(',')})`);
+      }
+
+      // Add nodes matching hardware model filter (only if this filter is enabled)
+      if (filterHwModelsEnabled && filterHwModels.length > 0) {
+        filterConditions.push(`n.hwModel IN (${filterHwModels.join(',')})`);
+      }
+
+      // If we have any SQL-based filters, combine them with OR (union logic)
+      // Regex filter will be applied in JavaScript after the query
+      if (filterConditions.length > 0) {
+        nodeFilterClause = `AND (${filterConditions.join(' OR ')})`;
+      }
+      // If no SQL filters but we have a regex (not default), we'll filter all nodes by regex
+      // If no filters at all and regex is default '.*', all nodes are eligible
     }
 
     // Get all nodes that are eligible for traceroute based on their status
@@ -2802,7 +2958,7 @@ class DatabaseService {
       ORDER BY n.lastHeard DESC
     `);
 
-    const eligibleNodes = stmt.all(
+    let eligibleNodes = stmt.all(
       localNodeNum,
       localNodeNum,
       localNodeNum,
@@ -2810,6 +2966,21 @@ class DatabaseService {
       localNodeNum,
       now - TWENTY_FOUR_HOURS_MS
     ) as DbNode[];
+
+    // Apply regex name filter in JavaScript (SQLite doesn't support regex natively)
+    // Only filter if the regex filter is enabled and it's not the default '.*' which matches everything
+    if (filterEnabled && filterRegexEnabled && filterNameRegex && filterNameRegex !== '.*') {
+      try {
+        const regex = new RegExp(filterNameRegex, 'i');
+        eligibleNodes = eligibleNodes.filter(node => {
+          const name = node.longName || node.shortName || node.nodeId || '';
+          return regex.test(name);
+        });
+      } catch (e) {
+        // Invalid regex, log and continue with unfiltered results
+        logger.warn(`Invalid traceroute filter regex: ${filterNameRegex}`, e);
+      }
+    }
 
     if (eligibleNodes.length === 0) {
       return null;
@@ -2912,6 +3083,187 @@ class DatabaseService {
   setAutoTracerouteNodeFilterEnabled(enabled: boolean): void {
     this.setSetting('tracerouteNodeFilterEnabled', enabled ? 'true' : 'false');
     logger.debug(`✅ Auto-traceroute node filter ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  // Advanced traceroute filter settings (stored as JSON in settings table)
+  getTracerouteFilterChannels(): number[] {
+    const value = this.getSetting('tracerouteFilterChannels');
+    if (!value) return [];
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+
+  setTracerouteFilterChannels(channels: number[]): void {
+    this.setSetting('tracerouteFilterChannels', JSON.stringify(channels));
+    logger.debug(`✅ Set traceroute filter channels: ${channels.join(', ') || 'none'}`);
+  }
+
+  getTracerouteFilterRoles(): number[] {
+    const value = this.getSetting('tracerouteFilterRoles');
+    if (!value) return [];
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+
+  setTracerouteFilterRoles(roles: number[]): void {
+    this.setSetting('tracerouteFilterRoles', JSON.stringify(roles));
+    logger.debug(`✅ Set traceroute filter roles: ${roles.join(', ') || 'none'}`);
+  }
+
+  getTracerouteFilterHwModels(): number[] {
+    const value = this.getSetting('tracerouteFilterHwModels');
+    if (!value) return [];
+    try {
+      return JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+
+  setTracerouteFilterHwModels(hwModels: number[]): void {
+    this.setSetting('tracerouteFilterHwModels', JSON.stringify(hwModels));
+    logger.debug(`✅ Set traceroute filter hardware models: ${hwModels.join(', ') || 'none'}`);
+  }
+
+  getTracerouteFilterNameRegex(): string {
+    const value = this.getSetting('tracerouteFilterNameRegex');
+    // Default to '.*' (match all) if not set
+    return value || '.*';
+  }
+
+  setTracerouteFilterNameRegex(regex: string): void {
+    this.setSetting('tracerouteFilterNameRegex', regex);
+    logger.debug(`✅ Set traceroute filter name regex: ${regex}`);
+  }
+
+  // Individual filter enabled flags
+  isTracerouteFilterNodesEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterNodesEnabled');
+    // Default to true for backward compatibility
+    return value !== 'false';
+  }
+
+  setTracerouteFilterNodesEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterNodesEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter nodes enabled: ${enabled}`);
+  }
+
+  isTracerouteFilterChannelsEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterChannelsEnabled');
+    // Default to true for backward compatibility
+    return value !== 'false';
+  }
+
+  setTracerouteFilterChannelsEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterChannelsEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter channels enabled: ${enabled}`);
+  }
+
+  isTracerouteFilterRolesEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterRolesEnabled');
+    // Default to true for backward compatibility
+    return value !== 'false';
+  }
+
+  setTracerouteFilterRolesEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterRolesEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter roles enabled: ${enabled}`);
+  }
+
+  isTracerouteFilterHwModelsEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterHwModelsEnabled');
+    // Default to true for backward compatibility
+    return value !== 'false';
+  }
+
+  setTracerouteFilterHwModelsEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterHwModelsEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter hardware models enabled: ${enabled}`);
+  }
+
+  isTracerouteFilterRegexEnabled(): boolean {
+    const value = this.getSetting('tracerouteFilterRegexEnabled');
+    // Default to true for backward compatibility
+    return value !== 'false';
+  }
+
+  setTracerouteFilterRegexEnabled(enabled: boolean): void {
+    this.setSetting('tracerouteFilterRegexEnabled', enabled ? 'true' : 'false');
+    logger.debug(`✅ Set traceroute filter regex enabled: ${enabled}`);
+  }
+
+  // Get all traceroute filter settings at once
+  getTracerouteFilterSettings(): {
+    enabled: boolean;
+    nodeNums: number[];
+    filterChannels: number[];
+    filterRoles: number[];
+    filterHwModels: number[];
+    filterNameRegex: string;
+    filterNodesEnabled: boolean;
+    filterChannelsEnabled: boolean;
+    filterRolesEnabled: boolean;
+    filterHwModelsEnabled: boolean;
+    filterRegexEnabled: boolean;
+  } {
+    return {
+      enabled: this.isAutoTracerouteNodeFilterEnabled(),
+      nodeNums: this.getAutoTracerouteNodes(),
+      filterChannels: this.getTracerouteFilterChannels(),
+      filterRoles: this.getTracerouteFilterRoles(),
+      filterHwModels: this.getTracerouteFilterHwModels(),
+      filterNameRegex: this.getTracerouteFilterNameRegex(),
+      filterNodesEnabled: this.isTracerouteFilterNodesEnabled(),
+      filterChannelsEnabled: this.isTracerouteFilterChannelsEnabled(),
+      filterRolesEnabled: this.isTracerouteFilterRolesEnabled(),
+      filterHwModelsEnabled: this.isTracerouteFilterHwModelsEnabled(),
+      filterRegexEnabled: this.isTracerouteFilterRegexEnabled(),
+    };
+  }
+
+  // Set all traceroute filter settings at once
+  setTracerouteFilterSettings(settings: {
+    enabled: boolean;
+    nodeNums: number[];
+    filterChannels: number[];
+    filterRoles: number[];
+    filterHwModels: number[];
+    filterNameRegex: string;
+    filterNodesEnabled?: boolean;
+    filterChannelsEnabled?: boolean;
+    filterRolesEnabled?: boolean;
+    filterHwModelsEnabled?: boolean;
+    filterRegexEnabled?: boolean;
+  }): void {
+    this.setAutoTracerouteNodeFilterEnabled(settings.enabled);
+    this.setAutoTracerouteNodes(settings.nodeNums);
+    this.setTracerouteFilterChannels(settings.filterChannels);
+    this.setTracerouteFilterRoles(settings.filterRoles);
+    this.setTracerouteFilterHwModels(settings.filterHwModels);
+    this.setTracerouteFilterNameRegex(settings.filterNameRegex);
+    // Individual filter enabled flags (default to true for backward compatibility)
+    if (settings.filterNodesEnabled !== undefined) {
+      this.setTracerouteFilterNodesEnabled(settings.filterNodesEnabled);
+    }
+    if (settings.filterChannelsEnabled !== undefined) {
+      this.setTracerouteFilterChannelsEnabled(settings.filterChannelsEnabled);
+    }
+    if (settings.filterRolesEnabled !== undefined) {
+      this.setTracerouteFilterRolesEnabled(settings.filterRolesEnabled);
+    }
+    if (settings.filterHwModelsEnabled !== undefined) {
+      this.setTracerouteFilterHwModelsEnabled(settings.filterHwModelsEnabled);
+    }
+    if (settings.filterRegexEnabled !== undefined) {
+      this.setTracerouteFilterRegexEnabled(settings.filterRegexEnabled);
+    }
+    logger.debug('✅ Updated all traceroute filter settings');
   }
 
   getTelemetryByType(telemetryType: string, limit: number = 100): DbTelemetry[] {

@@ -3,6 +3,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import api from '../services/api';
 import { logger } from '../utils/logger';
 import { Channel } from '../types/device';
+import { useToast } from './ToastContainer';
 
 interface VapidStatus {
   configured: boolean;
@@ -17,12 +18,16 @@ interface NotificationPreferences {
   enabledChannels: number[];
   enableDirectMessages: boolean;
   notifyOnEmoji: boolean;
+  notifyOnMqtt: boolean;
   notifyOnNewNode: boolean;
   notifyOnTraceroute: boolean;
   notifyOnInactiveNode: boolean;
+  notifyOnServerEvents: boolean;
+  prefixWithNodeName: boolean;
   monitoredNodes: string[];
   whitelist: string[];
   blacklist: string[];
+  appriseUrls: string[];
 }
 
 interface NotificationsTabProps {
@@ -31,6 +36,7 @@ interface NotificationsTabProps {
 
 const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
   const { t } = useTranslation();
+  const { showToast } = useToast();
   const [vapidStatus, setVapidStatus] = useState<VapidStatus | null>(null);
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [isSubscribing, setIsSubscribing] = useState(false);
@@ -48,12 +54,16 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
     enabledChannels: [],
     enableDirectMessages: true,
     notifyOnEmoji: true,
+    notifyOnMqtt: true,
     notifyOnNewNode: true,
     notifyOnTraceroute: true,
     notifyOnInactiveNode: false,
+    notifyOnServerEvents: false,
+    prefixWithNodeName: false,
     monitoredNodes: [],
     whitelist: ['Hi', 'Help'],
-    blacklist: ['Test', 'Copy']
+    blacklist: ['Test', 'Copy'],
+    appriseUrls: []
   });
   const [whitelistText, setWhitelistText] = useState('Hi\nHelp');
   const [blacklistText, setBlacklistText] = useState('Test\nCopy');
@@ -180,22 +190,10 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
       setWhitelistText(response.whitelist.join('\n'));
       setBlacklistText(response.blacklist.join('\n'));
       setSelectedMonitoredNodes(response.monitoredNodes || []);
-
-      // Load Apprise URLs if Apprise is enabled
-      if (response.enableApprise) {
-        loadAppriseUrls();
-      }
+      // Set Apprise URLs from preferences (now per-user)
+      setAppriseUrls((response.appriseUrls || []).join('\n'));
     } catch (_error) {
       logger.debug('No saved preferences, using defaults');
-    }
-  };
-
-  const loadAppriseUrls = async () => {
-    try {
-      const response = await api.get<{ urls: string[] }>('/api/apprise/urls');
-      setAppriseUrls(response.urls.join('\n'));
-    } catch (_error) {
-      logger.debug('No saved Apprise URLs, using empty');
     }
   };
 
@@ -229,25 +227,28 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
         .filter(w => w.length > 0)
         .slice(0, 100);
 
+      // Parse appriseUrls from textarea
+      const parsedAppriseUrls = appriseUrls
+        .split('\n')
+        .map(url => url.trim())
+        .filter(url => url.length > 0);
+
       const prefs: NotificationPreferences = {
         ...preferences,
         notifyOnInactiveNode: preferences.notifyOnInactiveNode,
         monitoredNodes: selectedMonitoredNodes,
         whitelist,
-        blacklist
+        blacklist,
+        appriseUrls: parsedAppriseUrls
       };
 
       await api.post('/api/push/preferences', prefs);
       setPreferences(prefs);
       logger.info('Notification preferences saved');
-
-      // Load Apprise URLs if Apprise was just enabled
-      if (prefs.enableApprise) {
-        loadAppriseUrls();
-      }
+      showToast(t('notifications.preferences_saved'), 'success');
     } catch (error) {
       logger.error('Failed to save preferences:', error);
-      alert(t('notifications.alert_save_failed'));
+      showToast(t('notifications.alert_save_failed'), 'error');
     } finally {
       setIsSavingPreferences(false);
     }
@@ -399,7 +400,13 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
         .map(url => url.trim())
         .filter(url => url.length > 0);
 
-      await api.post('/api/apprise/configure', { urls });
+      // Save as part of user preferences (per-user Apprise URLs)
+      const updatedPrefs = {
+        ...preferences,
+        appriseUrls: urls
+      };
+      await api.post('/api/push/preferences', updatedPrefs);
+      setPreferences(updatedPrefs);
       logger.info('Apprise URLs configured successfully');
       setAppriseTestStatus('✅ Configuration saved');
       const timeout = setTimeout(() => setAppriseTestStatus(''), 3000);
@@ -602,6 +609,30 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                 </label>
               </div>
 
+              {/* MQTT Messages Toggle */}
+              <div style={{
+                padding: '12px',
+                backgroundColor: '#252535',
+                borderRadius: '6px',
+                marginBottom: '16px',
+                border: '2px solid #3a3a3a'
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={preferences.notifyOnMqtt}
+                    onChange={(e) => {
+                      setPreferences(prev => ({
+                        ...prev,
+                        notifyOnMqtt: e.target.checked
+                      }));
+                    }}
+                    style={{ width: '18px', height: '18px' }}
+                  />
+                  <span style={{ fontWeight: '500' }}>📡 {t('notifications.mqtt_messages')}</span>
+                </label>
+              </div>
+
               {/* New Node Toggle */}
               <div style={{
                 padding: '12px',
@@ -801,6 +832,95 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                         </span>
                       )}
                     </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Server Events Notifications */}
+              <div style={{
+                padding: '12px',
+                backgroundColor: '#252535',
+                borderRadius: '6px',
+                marginBottom: '16px',
+                border: '2px solid #3a3a3a'
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={preferences.notifyOnServerEvents}
+                    onChange={(e) => {
+                      setPreferences(prev => ({
+                        ...prev,
+                        notifyOnServerEvents: e.target.checked
+                      }));
+                    }}
+                    style={{ width: '18px', height: '18px' }}
+                  />
+                  <span style={{ fontWeight: '500' }}>{t('notifications.notify_on_server_events')}</span>
+                </label>
+
+                {preferences.notifyOnServerEvents && (
+                  <div style={{
+                    marginLeft: '28px',
+                    marginTop: '12px',
+                    padding: '12px',
+                    background: 'var(--ctp-surface0)',
+                    border: '1px solid var(--ctp-surface2)',
+                    borderRadius: '6px'
+                  }}>
+                    <p style={{ marginBottom: '0.5rem', fontSize: '0.9em', color: 'var(--ctp-subtext0)' }}>
+                      {t('notifications.server_events_description')}
+                    </p>
+                    <ul style={{
+                      margin: '0.5rem 0 0 1.5rem',
+                      padding: 0,
+                      fontSize: '0.85em',
+                      color: 'var(--ctp-subtext1)',
+                      listStyleType: 'disc'
+                    }}>
+                      <li>{t('notifications.server_events_startup')}</li>
+                      <li>{t('notifications.server_events_disconnect')}</li>
+                      <li>{t('notifications.server_events_reconnect')}</li>
+                    </ul>
+                  </div>
+                )}
+              </div>
+
+              {/* Prefix with Node Name */}
+              <div style={{
+                padding: '12px',
+                backgroundColor: '#252535',
+                borderRadius: '6px',
+                marginBottom: '16px',
+                border: '2px solid #3a3a3a'
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={preferences.prefixWithNodeName}
+                    onChange={(e) => {
+                      setPreferences(prev => ({
+                        ...prev,
+                        prefixWithNodeName: e.target.checked
+                      }));
+                    }}
+                    style={{ width: '18px', height: '18px' }}
+                  />
+                  <span style={{ fontWeight: '500' }}>{t('notifications.prefix_with_node_name')}</span>
+                </label>
+
+                {preferences.prefixWithNodeName && (
+                  <div style={{
+                    marginLeft: '28px',
+                    marginTop: '12px',
+                    padding: '12px',
+                    background: 'var(--ctp-surface0)',
+                    border: '1px solid var(--ctp-surface2)',
+                    borderRadius: '6px'
+                  }}>
+                    <p style={{ marginBottom: '0', fontSize: '0.9em', color: 'var(--ctp-subtext0)' }}>
+                      {t('notifications.prefix_with_node_name_description')}
+                    </p>
                   </div>
                 )}
               </div>

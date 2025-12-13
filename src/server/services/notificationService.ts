@@ -12,6 +12,7 @@ export interface NotificationFilterContext {
   messageText: string;
   channelId: number;
   isDirectMessage: boolean;
+  viaMqtt?: boolean;
 }
 
 export interface BroadcastResult {
@@ -178,7 +179,7 @@ class NotificationService {
    * Optionally target a specific user ID
    */
   public async broadcastToPreferenceUsers(
-    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode',
+    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode' | 'notifyOnServerEvents',
     payload: NotificationPayload,
     targetUserId?: number
   ): Promise<void> {

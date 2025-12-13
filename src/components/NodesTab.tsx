@@ -43,7 +43,6 @@ interface NodesTabProps {
   shouldShowData: () => boolean;
   centerMapOnNode: (node: DeviceInfo) => void;
   toggleFavorite: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
-  toggleIgnored: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
   setActiveTab: React.Dispatch<React.SetStateAction<TabType>>;
   setSelectedDMNode: (nodeId: string) => void;
   markerRefs: React.MutableRefObject<Map<string, LeafletMarker>>;
@@ -78,7 +77,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   shouldShowData,
   centerMapOnNode,
   toggleFavorite,
-  toggleIgnored,
   setActiveTab,
   setSelectedDMNode,
   markerRefs,
@@ -123,8 +121,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   } = useTelemetryNodes();
 
   const {
-    nodeFilter,
-    setNodeFilter,
+    nodesNodeFilter,
+    setNodesNodeFilter,
     securityFilter,
     channelFilter,
     showIncompleteNodes,
@@ -254,17 +252,30 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   }, [sidebarSize]);
 
   // Map controls position state with localStorage persistence
+  // Position is relative to the map container (absolute positioning)
+  // We use a special value of -1 to indicate "use CSS default (right: 10px)"
+  const MAP_CONTROLS_DEFAULT_POSITION = { x: -1, y: 10 };
+
   const [mapControlsPosition, setMapControlsPosition] = useState(() => {
     const saved = localStorage.getItem('mapControlsPosition');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        return { x: parsed.x ?? 10, y: parsed.y ?? 10 };
+        // If x or y is invalid, use defaults
+        if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
+          // Sanity check: if position seems unreasonable, reset to default
+          // This handles migration from old viewport-based positions
+          if (parsed.x > 2000 || parsed.x < -100 || parsed.y > 2000 || parsed.y < -100) {
+            localStorage.removeItem('mapControlsPosition');
+            return MAP_CONTROLS_DEFAULT_POSITION;
+          }
+          return { x: parsed.x, y: parsed.y };
+        }
       } catch {
-        return { x: 10, y: 10 };
+        // Ignore parse errors
       }
     }
-    return { x: 10, y: 10 };
+    return MAP_CONTROLS_DEFAULT_POSITION;
   });
 
   // Map controls drag state
@@ -272,9 +283,51 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const [mapControlsDragStart, setMapControlsDragStart] = useState({ x: 0, y: 0 });
   const mapControlsRef = useRef<HTMLDivElement>(null);
 
-  // Save map controls position to localStorage
+  // Save map controls position to localStorage (only if not default)
   useEffect(() => {
-    localStorage.setItem('mapControlsPosition', JSON.stringify(mapControlsPosition));
+    if (mapControlsPosition.x !== -1) {
+      localStorage.setItem('mapControlsPosition', JSON.stringify(mapControlsPosition));
+    }
+  }, [mapControlsPosition]);
+
+  // Constrain map controls position to stay within the map container on mount and window resize
+  useEffect(() => {
+    const constrainMapControlsPosition = () => {
+      // Skip constraint for default position (x = -1 means use CSS right: 10px)
+      if (mapControlsPosition.x === -1) return;
+
+      const mapContainer = document.querySelector('.map-container');
+      const controls = mapControlsRef.current;
+      if (!mapContainer || !controls) return;
+
+      const containerRect = mapContainer.getBoundingClientRect();
+      const controlsRect = controls.getBoundingClientRect();
+      const padding = 10;
+
+      // Calculate max bounds relative to container
+      const maxX = containerRect.width - controlsRect.width - padding;
+      const maxY = containerRect.height - controlsRect.height - padding;
+
+      // Check if current position is out of bounds
+      const constrainedX = Math.max(padding, Math.min(mapControlsPosition.x, maxX));
+      const constrainedY = Math.max(padding, Math.min(mapControlsPosition.y, maxY));
+
+      // Update position if it was out of bounds
+      if (constrainedX !== mapControlsPosition.x || constrainedY !== mapControlsPosition.y) {
+        setMapControlsPosition({ x: constrainedX, y: constrainedY });
+      }
+    };
+
+    // Run on mount after a short delay to ensure elements are rendered
+    const timeoutId = setTimeout(constrainMapControlsPosition, 100);
+
+    // Run on window resize
+    window.addEventListener('resize', constrainMapControlsPosition);
+
+    return () => {
+      clearTimeout(timeoutId);
+      window.removeEventListener('resize', constrainMapControlsPosition);
+    };
   }, [mapControlsPosition]);
 
   // Check if user has permission to view packet monitor - needs at least one channel and messages permission
@@ -317,6 +370,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       spiderfierRef.current?.addMarker(ref, nodeId);
     }
   }, []); // Empty deps - function never changes
+
+  // Utility to prevent mousedown from triggering drag on form elements
+  // Firefox handles select/input mousedown differently, which can trigger panel drag
+  const stopPropagation = useCallback((e: React.MouseEvent) => e.stopPropagation(), []);
 
   // Stable callback factories for node item interactions
   const handleNodeClick = useCallback((node: DeviceInfo) => {
@@ -374,14 +431,32 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Drag handlers for sidebar
   const handleDragStart = useCallback((e: React.MouseEvent) => {
-    if (isNodeListCollapsed) return;
+    if (isNodeListCollapsed || isTouchDevice) return; // Disable drag on mobile
+    // Don't start drag if clicking on an input, button, select, or anything inside node-controls
+    // Check this FIRST before doing anything else
+    const target = e.target as HTMLElement;
+    const isInteractiveElement = 
+      target.tagName === 'INPUT' || 
+      target.tagName === 'BUTTON' || 
+      target.tagName === 'SELECT' || 
+      target.tagName === 'OPTION' ||
+      target.closest('.node-controls') !== null ||
+      target.closest('input') !== null ||
+      target.closest('button') !== null ||
+      target.closest('select') !== null;
+    
+    if (isInteractiveElement) {
+      // Don't prevent default - allow normal interaction
+      e.stopPropagation();
+      return;
+    }
     e.preventDefault();
     setIsDragging(true);
     setDragStart({
       x: e.clientX - sidebarPosition.x,
       y: e.clientY - sidebarPosition.y,
     });
-  }, [isNodeListCollapsed, sidebarPosition]);
+  }, [isNodeListCollapsed, sidebarPosition, isTouchDevice]);
 
   const handleDragMove = useCallback((e: MouseEvent) => {
     if (!isDragging) return;
@@ -406,7 +481,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Resize handlers for sidebar
   const handleResizeStart = useCallback((e: React.MouseEvent) => {
-    if (isNodeListCollapsed) return;
+    if (isNodeListCollapsed || isTouchDevice) return; // Disable resize on mobile
     e.preventDefault();
     e.stopPropagation();
     setIsResizing(true);
@@ -418,7 +493,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       width: sidebarSize.width || 350,
       height: sidebarSize.height || currentHeight,
     });
-  }, [isNodeListCollapsed, sidebarSize]);
+  }, [isNodeListCollapsed, sidebarSize, isTouchDevice]);
 
   const handleResizeMove = useCallback((e: MouseEvent) => {
     if (!isResizing) return;
@@ -481,15 +556,34 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Map controls drag handlers
   const handleMapControlsDragStart = useCallback((e: React.MouseEvent) => {
-    if (isMapControlsCollapsed) return;
+    if (isMapControlsCollapsed || isTouchDevice) return; // Disable drag on mobile
     e.preventDefault();
     e.stopPropagation();
+
+    // If position is default (-1), calculate actual position from element
+    let currentX = mapControlsPosition.x;
+    let currentY = mapControlsPosition.y;
+
+    if (currentX === -1) {
+      // Convert from CSS right: 10px to left-based coordinates
+      const mapContainer = document.querySelector('.map-container');
+      const controls = mapControlsRef.current;
+      if (mapContainer && controls) {
+        const containerRect = mapContainer.getBoundingClientRect();
+        const controlsRect = controls.getBoundingClientRect();
+        currentX = controlsRect.left - containerRect.left;
+        currentY = controlsRect.top - containerRect.top;
+        // Update the position to be explicit
+        setMapControlsPosition({ x: currentX, y: currentY });
+      }
+    }
+
     setIsDraggingMapControls(true);
     setMapControlsDragStart({
-      x: e.clientX - mapControlsPosition.x,
-      y: e.clientY - mapControlsPosition.y,
+      x: e.clientX - currentX,
+      y: e.clientY - currentY,
     });
-  }, [isMapControlsCollapsed, mapControlsPosition]);
+  }, [isMapControlsCollapsed, mapControlsPosition, isTouchDevice]);
 
   const handleMapControlsDragMove = useCallback((e: MouseEvent) => {
     if (!isDraggingMapControls) return;
@@ -760,11 +854,23 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           height: isNodeListCollapsed ? undefined : (sidebarSize.height ? `${sidebarSize.height}px` : 'auto'),
           maxHeight: isNodeListCollapsed ? undefined : (sidebarSize.height ? `${sidebarSize.height}px` : 'calc(100% - 32px)'),
         }}
+        onMouseDown={(e) => {
+          // If clicking on node-controls or any interactive element, don't let the drag handler run
+          const target = e.target as HTMLElement;
+          if (
+            target.closest('.node-controls') ||
+            target.tagName === 'INPUT' ||
+            target.tagName === 'BUTTON' ||
+            target.tagName === 'SELECT'
+          ) {
+            e.stopPropagation();
+          }
+        }}
       >
-        <div 
+        <div
           className="sidebar-header"
           onMouseDown={handleDragStart}
-          style={{ cursor: isNodeListCollapsed ? 'default' : 'grab' }}
+          style={{ cursor: (isNodeListCollapsed || isTouchDevice) ? 'default' : 'grab' }}
         >
           <button
             className="collapse-nodes-btn"
@@ -801,14 +907,23 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             <input
               type="text"
               placeholder={t('nodes.filter_placeholder')}
-              value={nodeFilter}
-              onChange={(e) => setNodeFilter(e.target.value)}
+              value={nodesNodeFilter}
+              onChange={(e) => setNodesNodeFilter(e.target.value)}
+              onMouseDown={stopPropagation}
               className="filter-input-small"
             />
             <div className="sort-controls">
               <button
                 className="filter-popup-btn"
-                onClick={handleToggleFilterPopup}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.nativeEvent.stopImmediatePropagation();
+                  handleToggleFilterPopup();
+                }}
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  e.nativeEvent.stopImmediatePropagation();
+                }}
                 title={t('nodes.filter_title')}
               >
                 {t('common.filter')}
@@ -816,6 +931,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <select
                 value={sortField}
                 onChange={(e) => setSortField(e.target.value as any)}
+                onMouseDown={stopPropagation}
                 className="sort-dropdown"
                 title={t('nodes.sort_by')}
               >
@@ -830,7 +946,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               </select>
               <button
                 className="sort-direction-btn"
-                onClick={handleToggleSortDirection}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.nativeEvent.stopImmediatePropagation();
+                  handleToggleSortDirection();
+                }}
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  e.nativeEvent.stopImmediatePropagation();
+                }}
                 title={sortDirection === 'asc' ? t('nodes.ascending') : t('nodes.descending')}
               >
                 {sortDirection === 'asc' ? '↑' : '↓'}
@@ -839,7 +963,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           </div>
           )}
         </div>
-
         {!isNodeListCollapsed && (
         <div className="nodes-list">
           {shouldShowData() ? (() => {
@@ -890,25 +1013,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                         onClick={handleFavoriteClick(node)}
                       >
                         {node.isFavorite ? '⭐' : '☆'}
-                      </button>
-                      <button
-                        className="ignore-button"
-                        title={node.isIgnored ? t('nodes.remove_ignored') : t('nodes.add_ignored')}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleIgnored(node, e);
-                        }}
-                        style={{
-                          background: 'none',
-                          border: 'none',
-                          cursor: 'pointer',
-                          padding: '0.25rem',
-                          fontSize: '1.2rem',
-                          opacity: node.isIgnored ? 1 : 0.5,
-                          transition: 'opacity 0.2s'
-                        }}
-                      >
-                        🚫
                       </button>
                       <div className="node-name-text">
                         <div className="node-longname">
@@ -1012,7 +1116,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               </>
             ) : (
               <div className="no-data">
-                {securityFilter !== 'all' ? 'No nodes match security filter' : (nodeFilter ? 'No nodes match filter' : 'No nodes detected')}
+                {securityFilter !== 'all' ? 'No nodes match security filter' : (nodesNodeFilter ? 'No nodes match filter' : 'No nodes detected')}
               </div>
             );
           })() : (
@@ -1041,11 +1145,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             <div
               ref={mapControlsRef}
               className={`map-controls ${isMapControlsCollapsed ? 'collapsed' : ''}`}
-              style={{
-                left: isMapControlsCollapsed ? undefined : `${mapControlsPosition.x}px`,
-                top: isMapControlsCollapsed ? undefined : `${mapControlsPosition.y}px`,
-                right: isMapControlsCollapsed ? undefined : 'auto',
-              }}
+              style={isTouchDevice ? undefined : (
+                // If collapsed, don't apply any position styles (use CSS defaults)
+                // If position is default (-1), don't apply left (CSS will use right: 10px)
+                isMapControlsCollapsed ? undefined : {
+                  left: mapControlsPosition.x === -1 ? undefined : `${mapControlsPosition.x}px`,
+                  top: `${mapControlsPosition.y}px`,
+                  right: mapControlsPosition.x === -1 ? undefined : 'auto',
+                }
+              )}
             >
               <button
                 className="map-controls-collapse-btn"
@@ -1058,7 +1166,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <div
                 className="map-controls-header"
                 style={{
-                  cursor: isMapControlsCollapsed ? 'default' : (isDraggingMapControls ? 'grabbing' : 'grab'),
+                  cursor: (isMapControlsCollapsed || isTouchDevice) ? 'default' : (isDraggingMapControls ? 'grabbing' : 'grab'),
                 }}
                 onMouseDown={handleMapControlsDragStart}
               >

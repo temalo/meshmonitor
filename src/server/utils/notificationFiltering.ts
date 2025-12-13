@@ -5,6 +5,7 @@ export interface NotificationFilterContext {
   messageText: string;
   channelId: number;
   isDirectMessage: boolean;
+  viaMqtt?: boolean;
 }
 
 export interface NotificationPreferences {
@@ -13,12 +14,16 @@ export interface NotificationPreferences {
   enabledChannels: number[];
   enableDirectMessages: boolean;
   notifyOnEmoji: boolean;
+  notifyOnMqtt: boolean;
   notifyOnNewNode: boolean;
   notifyOnTraceroute: boolean;
   notifyOnInactiveNode: boolean;
+  notifyOnServerEvents: boolean;
+  prefixWithNodeName: boolean;
   monitoredNodes: string[];
   whitelist: string[];
   blacklist: string[];
+  appriseUrls: string[];
 }
 
 /**
@@ -41,12 +46,16 @@ export function getUserNotificationPreferences(userId: number): NotificationPref
         enabled_channels,
         enable_direct_messages,
         notify_on_emoji,
+        notify_on_mqtt,
         notify_on_new_node,
         notify_on_traceroute,
         notify_on_inactive_node,
+        notify_on_server_events,
+        prefix_with_node_name,
         monitored_nodes,
         whitelist,
-        blacklist
+        blacklist,
+        apprise_urls
       FROM user_notification_preferences
       WHERE user_id = ?
     `);
@@ -61,12 +70,16 @@ export function getUserNotificationPreferences(userId: number): NotificationPref
         enabledChannels: row.enabled_channels ? JSON.parse(row.enabled_channels) : [],
         enableDirectMessages: Boolean(row.enable_direct_messages),
         notifyOnEmoji: row.notify_on_emoji !== undefined ? Boolean(row.notify_on_emoji) : true,
+        notifyOnMqtt: row.notify_on_mqtt !== undefined ? Boolean(row.notify_on_mqtt) : true,
         notifyOnNewNode: row.notify_on_new_node !== undefined ? Boolean(row.notify_on_new_node) : true,
         notifyOnTraceroute: row.notify_on_traceroute !== undefined ? Boolean(row.notify_on_traceroute) : true,
         notifyOnInactiveNode: row.notify_on_inactive_node !== undefined ? Boolean(row.notify_on_inactive_node) : false,
+        notifyOnServerEvents: row.notify_on_server_events !== undefined ? Boolean(row.notify_on_server_events) : false,
+        prefixWithNodeName: row.prefix_with_node_name !== undefined ? Boolean(row.prefix_with_node_name) : false,
         monitoredNodes: row.monitored_nodes ? JSON.parse(row.monitored_nodes) : [],
         whitelist: row.whitelist ? JSON.parse(row.whitelist) : [],
-        blacklist: row.blacklist ? JSON.parse(row.blacklist) : []
+        blacklist: row.blacklist ? JSON.parse(row.blacklist) : [],
+        appriseUrls: row.apprise_urls ? JSON.parse(row.apprise_urls) : []
       };
     }
 
@@ -82,12 +95,16 @@ export function getUserNotificationPreferences(userId: number): NotificationPref
           ? oldPrefs.enableDirectMessages
           : true,
         notifyOnEmoji: true, // Default to enabled for backward compatibility
+        notifyOnMqtt: true, // Default to enabled for backward compatibility
         notifyOnNewNode: true, // Default to enabled for backward compatibility
         notifyOnTraceroute: true, // Default to enabled for backward compatibility
         notifyOnInactiveNode: false, // Default to disabled
+        notifyOnServerEvents: false, // Default to disabled
+        prefixWithNodeName: false, // Default to disabled
         monitoredNodes: [], // Default to empty array
         whitelist: oldPrefs.whitelist || [],
-        blacklist: oldPrefs.blacklist || []
+        blacklist: oldPrefs.blacklist || [],
+        appriseUrls: [] // Default to empty array
       };
     }
 
@@ -118,23 +135,27 @@ export function saveUserNotificationPreferences(
       INSERT INTO user_notification_preferences (
         user_id, enable_web_push, enable_apprise,
         enabled_channels, enable_direct_messages, notify_on_emoji,
-        notify_on_new_node, notify_on_traceroute,
-        notify_on_inactive_node, monitored_nodes,
-        whitelist, blacklist,
+        notify_on_mqtt, notify_on_new_node, notify_on_traceroute,
+        notify_on_inactive_node, notify_on_server_events, prefix_with_node_name,
+        monitored_nodes, whitelist, blacklist, apprise_urls,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id) DO UPDATE SET
         enable_web_push = excluded.enable_web_push,
         enable_apprise = excluded.enable_apprise,
         enabled_channels = excluded.enabled_channels,
         enable_direct_messages = excluded.enable_direct_messages,
         notify_on_emoji = excluded.notify_on_emoji,
+        notify_on_mqtt = excluded.notify_on_mqtt,
         notify_on_new_node = excluded.notify_on_new_node,
         notify_on_traceroute = excluded.notify_on_traceroute,
         notify_on_inactive_node = excluded.notify_on_inactive_node,
+        notify_on_server_events = excluded.notify_on_server_events,
+        prefix_with_node_name = excluded.prefix_with_node_name,
         monitored_nodes = excluded.monitored_nodes,
         whitelist = excluded.whitelist,
         blacklist = excluded.blacklist,
+        apprise_urls = excluded.apprise_urls,
         updated_at = excluded.updated_at
     `);
 
@@ -145,12 +166,16 @@ export function saveUserNotificationPreferences(
       JSON.stringify(preferences.enabledChannels),
       preferences.enableDirectMessages ? 1 : 0,
       preferences.notifyOnEmoji ? 1 : 0,
+      preferences.notifyOnMqtt ? 1 : 0,
       preferences.notifyOnNewNode ? 1 : 0,
       preferences.notifyOnTraceroute ? 1 : 0,
       preferences.notifyOnInactiveNode ? 1 : 0,
+      preferences.notifyOnServerEvents ? 1 : 0,
+      preferences.prefixWithNodeName ? 1 : 0,
       JSON.stringify(preferences.monitoredNodes),
       JSON.stringify(preferences.whitelist),
       JSON.stringify(preferences.blacklist),
+      JSON.stringify(preferences.appriseUrls || []),
       now,
       now
     );
@@ -226,8 +251,9 @@ function isEmojiOnlyMessage(text: string): boolean {
  * 1. WHITELIST - If message contains whitelisted word, ALLOW (highest priority)
  * 2. BLACKLIST - If message contains blacklisted word, FILTER
  * 3. EMOJI - If notifyOnEmoji is disabled and message is emoji-only, FILTER
- * 4. CHANNEL/DM - If channel/DM is disabled, FILTER
- * 5. DEFAULT - ALLOW
+ * 4. MQTT - If notifyOnMqtt is disabled and message came via MQTT, FILTER
+ * 5. CHANNEL/DM - If channel/DM is disabled, FILTER
+ * 6. DEFAULT - ALLOW
  */
 export function shouldFilterNotification(
   userId: number,
@@ -270,7 +296,13 @@ export function shouldFilterNotification(
     return true; // Filter
   }
 
-  // CHANNEL/DM CHECK (fourth priority)
+  // MQTT CHECK (fourth priority)
+  if (!prefs.notifyOnMqtt && filterContext.viaMqtt === true) {
+    logger.debug(`📡 MQTT message filtered for user ${userId}`);
+    return true; // Filter
+  }
+
+  // CHANNEL/DM CHECK (fifth priority)
   if (filterContext.isDirectMessage) {
     if (!prefs.enableDirectMessages) {
       logger.debug(`🔇 Direct messages disabled for user ${userId}`);
@@ -284,4 +316,31 @@ export function shouldFilterNotification(
   }
 
   return false; // Don't filter (allow by default)
+}
+
+/**
+ * Apply node name prefix to a notification body if the user has it enabled
+ * @param userId - The user ID to check preferences for
+ * @param body - The original notification body
+ * @param nodeName - The local node name to use as prefix
+ * @returns The body with prefix if enabled, otherwise the original body
+ */
+export function applyNodeNamePrefix(
+  userId: number | null | undefined,
+  body: string,
+  nodeName: string | null | undefined
+): string {
+  // No prefix if no user ID or node name
+  if (!userId || !nodeName) {
+    return body;
+  }
+
+  // Check user preferences
+  const prefs = getUserNotificationPreferences(userId);
+  if (!prefs || !prefs.prefixWithNodeName) {
+    return body;
+  }
+
+  // Apply prefix
+  return `[${nodeName}] ${body}`;
 }

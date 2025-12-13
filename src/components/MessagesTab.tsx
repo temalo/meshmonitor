@@ -85,8 +85,10 @@ export interface MessagesTabProps {
   ) => Promise<void>;
 
   // UI state
-  nodeFilter: string;
+  nodeFilter: string; // Deprecated - use messagesNodeFilter instead
   setNodeFilter: (filter: string) => void;
+  messagesNodeFilter: string;
+  setMessagesNodeFilter: (filter: string) => void;
   dmFilter: 'all' | 'unread' | 'recent';
   setDmFilter: (filter: 'all' | 'unread' | 'recent') => void;
   securityFilter: 'all' | 'flaggedOnly' | 'hideFlagged';
@@ -120,6 +122,7 @@ export interface MessagesTabProps {
   handleSenderClick: (nodeId: string, event: React.MouseEvent) => void;
   handleSendTapback: (emoji: string, message: MeshMessage) => void;
   getRecentTraceroute: (nodeId: string) => TracerouteData | null;
+  toggleIgnored: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
 
   // Modal controls
   setShowTracerouteHistoryModal: (show: boolean) => void;
@@ -150,8 +153,10 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   setReplyingTo,
   unreadCountsData,
   markMessagesAsRead,
-  nodeFilter,
-  setNodeFilter,
+  nodeFilter: _nodeFilter, // Deprecated - kept for backward compatibility
+  messagesNodeFilter,
+  setMessagesNodeFilter,
+  setNodeFilter: _setNodeFilter, // Deprecated - kept for backward compatibility
   dmFilter,
   setDmFilter,
   securityFilter,
@@ -177,6 +182,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   handleSenderClick,
   handleSendTapback,
   getRecentTraceroute,
+  toggleIgnored,
   setShowTracerouteHistoryModal,
   setShowPurgeDataModal,
   setEmojiPickerMessage,
@@ -301,8 +307,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
       const nodeChannel = node.channel ?? 0;
       if (nodeChannel !== channelFilter) return false;
     }
-    if (!nodeFilter) return true;
-    const searchTerm = nodeFilter.toLowerCase();
+    if (!messagesNodeFilter) return true;
+    const searchTerm = messagesNodeFilter.toLowerCase();
     return (
       node.user?.longName?.toLowerCase().includes(searchTerm) ||
       node.user?.shortName?.toLowerCase().includes(searchTerm) ||
@@ -346,8 +352,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
               <input
                 type="text"
                 placeholder={t('messages.filter_placeholder')}
-                value={nodeFilter}
-                onChange={e => setNodeFilter(e.target.value)}
+                value={messagesNodeFilter}
+                onChange={e => setMessagesNodeFilter(e.target.value)}
                 className="filter-input-small"
               />
               <div className="sort-controls">
@@ -522,8 +528,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
             {sortedNodesWithMessages
               .filter(node => {
                 if (!showIncompleteNodes && !isNodeComplete(node)) return false;
-                if (!nodeFilter) return true;
-                const searchTerm = nodeFilter.toLowerCase();
+                if (!messagesNodeFilter) return true;
+                const searchTerm = messagesNodeFilter.toLowerCase();
                 return (
                   node.user?.longName?.toLowerCase().includes(searchTerm) ||
                   node.user?.shortName?.toLowerCase().includes(searchTerm) ||
@@ -824,6 +830,24 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                   >
                     📍 {t('messages.exchange_position')}
                     {positionLoading === selectedDMNode && <span className="spinner"></span>}
+                  </button>
+                )}
+                {hasPermission('messages', 'write') && selectedNode && (
+                  <button
+                    onClick={(e) => toggleIgnored(selectedNode, e)}
+                    className={selectedNode.isIgnored ? 'traceroute-btn' : 'danger-btn'}
+                    style={{
+                      backgroundColor: selectedNode.isIgnored ? '#28a745' : '#6c757d',
+                      color: 'white',
+                      border: 'none',
+                      padding: '0.5rem 1rem',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontWeight: 'bold',
+                    }}
+                    title={selectedNode.isIgnored ? t('messages.unignore_node_title') : t('messages.ignore_node_title')}
+                  >
+                    {selectedNode.isIgnored ? t('messages.unignore_node') : t('messages.ignore_node')}
                   </button>
                 )}
                 {hasPermission('messages', 'write') && (

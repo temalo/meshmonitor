@@ -1,6 +1,7 @@
 import { logger } from '../../utils/logger.js';
 import databaseService from '../../services/database.js';
-import { getUserNotificationPreferences, getUsersWithServiceEnabled, shouldFilterNotification as shouldFilterNotificationUtil } from '../utils/notificationFiltering.js';
+import { getUserNotificationPreferences, getUsersWithServiceEnabled, shouldFilterNotification as shouldFilterNotificationUtil, applyNodeNamePrefix } from '../utils/notificationFiltering.js';
+import meshtasticManager from '../meshtasticManager.js';
 
 export interface AppriseNotificationPayload {
   title: string;
@@ -137,7 +138,8 @@ class AppriseNotificationService {
   }
 
   /**
-   * Send a notification via Apprise
+   * Send a notification via Apprise to all globally configured URLs
+   * @deprecated Use sendNotificationToUrls for per-user notifications
    */
   public async sendNotification(payload: AppriseNotificationPayload): Promise<boolean> {
     if (!this.isAvailable()) {
@@ -181,6 +183,61 @@ class AppriseNotificationService {
   }
 
   /**
+   * Send a notification to specific Apprise URLs (per-user)
+   * Uses the Apprise API with inline URLs instead of the global config
+   */
+  public async sendNotificationToUrls(
+    payload: AppriseNotificationPayload,
+    urls: string[]
+  ): Promise<boolean> {
+    if (!this.isAvailable()) {
+      logger.debug('⚠️  Apprise not available, skipping notification');
+      return false;
+    }
+
+    if (!urls || urls.length === 0) {
+      logger.debug('⚠️  No Apprise URLs provided, skipping notification');
+      return false;
+    }
+
+    try {
+      // Apprise API supports sending to specific URLs via the 'urls' parameter
+      const response = await fetch(`${this.config!.url}/notify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          urls: urls,
+          title: payload.title,
+          body: payload.body,
+          type: payload.type || 'info'
+        }),
+        signal: AbortSignal.timeout(10000)
+      });
+
+      if (!response.ok) {
+        let errorDetails = '';
+        try {
+          const errorData = await response.json();
+          errorDetails = errorData.error || JSON.stringify(errorData);
+        } catch {
+          errorDetails = await response.text();
+        }
+        logger.error(`❌ Apprise notification failed: ${response.status} - ${errorDetails}`);
+        return false;
+      }
+
+      const data = await response.json();
+      logger.debug(`✅ Sent Apprise notification: ${payload.title} (to ${data.sent_to || urls.length} services)`);
+      return true;
+    } catch (error: any) {
+      logger.error('❌ Failed to send Apprise notification:', error);
+      return false;
+    }
+  }
+
+  /**
    * Broadcast notification with per-user filtering
    * Note: Uses shared filtering logic from pushNotificationService
    */
@@ -190,6 +247,7 @@ class AppriseNotificationService {
       messageText: string;
       channelId: number;
       isDirectMessage: boolean;
+      viaMqtt?: boolean;
     }
   ): Promise<{ sent: number; failed: number; filtered: number }> {
     if (!this.isAvailable()) {
@@ -211,7 +269,11 @@ class AppriseNotificationService {
       return { sent: 0, failed: 0, filtered: 0 };
     }
 
-    // Per-user filtering
+    // Get local node name for prefix
+    const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+    const localNodeName = localNodeInfo?.longName || null;
+
+    // Per-user filtering and sending to user-specific URLs
     for (const userId of users) {
       // Import and use shared filter logic
       const shouldFilter = this.shouldFilterNotification(userId, filterContext);
@@ -221,7 +283,22 @@ class AppriseNotificationService {
         continue;
       }
 
-      const success = await this.sendNotification(payload);
+      // Get user's preferences to get their Apprise URLs
+      const prefs = getUserNotificationPreferences(userId);
+      if (!prefs || !prefs.appriseUrls || prefs.appriseUrls.length === 0) {
+        logger.debug(`⚠️  No Apprise URLs configured for user ${userId}, skipping`);
+        filtered++;
+        continue;
+      }
+
+      // Apply node name prefix if user has it enabled
+      const prefixedBody = applyNodeNamePrefix(userId, payload.body, localNodeName);
+      const notificationPayload = prefixedBody !== payload.body
+        ? { ...payload, body: prefixedBody }
+        : payload;
+
+      // Send to user's specific URLs
+      const success = await this.sendNotificationToUrls(notificationPayload, prefs.appriseUrls);
       if (success) {
         sent++;
       } else {
@@ -261,6 +338,7 @@ class AppriseNotificationService {
       messageText: string;
       channelId: number;
       isDirectMessage: boolean;
+      viaMqtt?: boolean;
     }
   ): boolean {
     // Check if user has Apprise enabled
@@ -279,7 +357,7 @@ class AppriseNotificationService {
    * Used for special notifications like new nodes, traceroutes, and inactive nodes
    */
   public async broadcastToPreferenceUsers(
-    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode',
+    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode' | 'notifyOnServerEvents',
     payload: AppriseNotificationPayload,
     targetUserId?: number
   ): Promise<{ sent: number; failed: number; filtered: number }> {
@@ -291,6 +369,10 @@ class AppriseNotificationService {
     const users = getUsersWithServiceEnabled('apprise');
     logger.info(`📢 Broadcasting ${preferenceKey} notification to ${users.length} Apprise users${targetUserId ? ` (target user: ${targetUserId})` : ''}`);
 
+    // Get local node name for prefix
+    const localNodeInfo = meshtasticManager.getLocalNodeInfo();
+    const localNodeName = localNodeInfo?.longName || null;
+
     for (const userId of users) {
       // If targetUserId is specified, only send to that user
       if (targetUserId !== undefined && userId !== targetUserId) {
@@ -298,14 +380,28 @@ class AppriseNotificationService {
         continue;
       }
 
-      // Check if user has this preference enabled
+      // Check if user has this preference enabled and has URLs configured
       const prefs = getUserNotificationPreferences(userId);
       if (!prefs || !prefs.enableApprise || !prefs[preferenceKey]) {
         filtered++;
         continue;
       }
 
-      const success = await this.sendNotification(payload);
+      // Check if user has Apprise URLs configured
+      if (!prefs.appriseUrls || prefs.appriseUrls.length === 0) {
+        logger.debug(`⚠️  No Apprise URLs configured for user ${userId}, skipping`);
+        filtered++;
+        continue;
+      }
+
+      // Apply node name prefix if user has it enabled
+      const prefixedBody = applyNodeNamePrefix(userId, payload.body, localNodeName);
+      const notificationPayload = prefixedBody !== payload.body
+        ? { ...payload, body: prefixedBody }
+        : payload;
+
+      // Send to user's specific URLs
+      const success = await this.sendNotificationToUrls(notificationPayload, prefs.appriseUrls);
       if (success) {
         sent++;
       } else {

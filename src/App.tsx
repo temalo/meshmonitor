@@ -26,6 +26,8 @@ import AutoWelcomeSection from './components/AutoWelcomeSection';
 import AutoResponderSection from './components/AutoResponderSection';
 import { ToastProvider, useToast } from './components/ToastContainer';
 import { RebootModal } from './components/RebootModal';
+import { AppBanners } from './components/AppBanners';
+import { PurgeDataModal } from './components/PurgeDataModal';
 // import { version } from '../package.json' // Removed - footer no longer displayed
 import { type TemperatureUnit } from './utils/temperature';
 // calculateDistance and formatDistance moved to useTraceroutePaths hook
@@ -129,6 +131,7 @@ function App() {
     maxHops: number;
     showPKI: boolean;
     showUnknown: boolean;
+    showIgnored: boolean;
     deviceRoles: number[];
     channels: number[];
   }
@@ -152,6 +155,10 @@ function App() {
         if (!parsed.deviceRoles) {
           parsed.deviceRoles = [];
         }
+        // Add showIgnored if it doesn't exist (backward compatibility)
+        if (parsed.showIgnored === undefined) {
+          parsed.showIgnored = false;
+        }
         return parsed;
       } catch (e) {
         logger.error('Failed to parse saved node filters:', e);
@@ -168,6 +175,7 @@ function App() {
       maxHops: 10,
       showPKI: false,
       showUnknown: false,
+      showIgnored: false,
       deviceRoles: [] as number[], // Empty array means show all roles
       channels: [] as number[],
     };
@@ -426,8 +434,11 @@ function App() {
     setError,
     tracerouteLoading,
     setTracerouteLoading,
-    nodeFilter,
-    setNodeFilter,
+    nodeFilter: _nodeFilter, // Deprecated - kept for backward compatibility
+    setNodeFilter: _setNodeFilter, // Deprecated
+    nodesNodeFilter,
+    messagesNodeFilter,
+    setMessagesNodeFilter,
     securityFilter,
     setSecurityFilter,
     channelFilter,
@@ -703,12 +714,17 @@ function App() {
 
   // Function to detect MQTT/bridge messages that should be filtered
   const isMqttBridgeMessage = (msg: MeshMessage): boolean => {
+    // Primary check: use the viaMqtt field from the packet if available
+    if (msg.viaMqtt === true) {
+      return true;
+    }
+
     // Filter messages from unknown senders
     if (msg.from === 'unknown' || msg.fromNodeId === 'unknown') {
       return true;
     }
 
-    // Filter MQTT-related text patterns
+    // Filter MQTT-related text patterns (fallback for older messages without viaMqtt)
     const mqttPatterns = [
       'mqtt.',
       'areyoumeshingwith.us',
@@ -990,6 +1006,29 @@ function App() {
           } else {
             setUpdateAvailable(false);
           }
+
+          // If auto-upgrade was triggered by the server, check for active upgrade status
+          // This handles the case when auto-upgrade immediate is enabled
+          if (data.autoUpgradeTriggered && !upgradeInProgress) {
+            logger.info('Auto-upgrade was triggered by server, checking for active upgrade...');
+            // The upgrade status will be picked up by the checkUpgradeStatus effect
+            // but we can also immediately fetch it here
+            try {
+              const statusResponse = await authFetch(`${baseUrl}/api/upgrade/status`);
+              if (statusResponse.ok) {
+                const statusData = await statusResponse.json();
+                if (statusData.activeUpgrade) {
+                  setUpgradeInProgress(true);
+                  setUpgradeId(statusData.activeUpgrade.upgradeId);
+                  setUpgradeStatus(statusData.activeUpgrade.currentStep);
+                  setUpgradeProgress(statusData.activeUpgrade.progress);
+                  pollUpgradeStatus(statusData.activeUpgrade.upgradeId);
+                }
+              }
+            } catch (statusError) {
+              logger.debug('Failed to fetch upgrade status after auto-upgrade trigger:', statusError);
+            }
+          }
         } else if (response.status == 404) {
           clearInterval(interval);
         }
@@ -1006,7 +1045,7 @@ function App() {
     return () => clearInterval(interval);
   }, [baseUrl]);
 
-  // Check if auto-upgrade is enabled
+  // Check if auto-upgrade is enabled and if an upgrade is already in progress
   useEffect(() => {
     const checkUpgradeStatus = async () => {
       try {
@@ -1014,6 +1053,20 @@ function App() {
         if (response.ok) {
           const data = await response.json();
           setUpgradeEnabled(data.enabled && data.deploymentMethod === 'docker');
+
+          // If an upgrade is already in progress (e.g., auto-upgrade was triggered),
+          // set the upgrade state and start polling for status
+          if (data.activeUpgrade && !upgradeInProgress) {
+            logger.info('Active upgrade detected, resuming progress tracking');
+            setUpgradeInProgress(true);
+            setUpgradeId(data.activeUpgrade.upgradeId);
+            setUpgradeStatus(data.activeUpgrade.currentStep);
+            setUpgradeProgress(data.activeUpgrade.progress);
+            setLatestVersion(data.activeUpgrade.toVersion);
+            setUpdateAvailable(true);
+            // Start polling for status updates
+            pollUpgradeStatus(data.activeUpgrade.upgradeId);
+          }
         }
       } catch (error) {
         logger.debug('Auto-upgrade not available:', error);
@@ -2944,7 +2997,11 @@ function App() {
       return node.lastHeard >= cutoffTime;
     });
 
-    const textFiltered = filterNodes(ageFiltered, nodeFilter);
+    // Only apply nodesNodeFilter when Nodes tab is active
+    // Messages tab will apply its own messagesNodeFilter
+    const textFiltered = activeTab === 'nodes' 
+      ? filterNodes(ageFiltered, nodesNodeFilter)
+      : ageFiltered;
 
     // Apply advanced filters
     const advancedFiltered = textFiltered.filter(node => {
@@ -3021,6 +3078,13 @@ function App() {
         if (!isShowMode && matches) return false;
       }
 
+      // Ignored nodes filter - hide ignored nodes by default
+      // When showIgnored is false (default): hide ignored nodes
+      // When showIgnored is true: show ignored nodes
+      if (!nodeFilters.showIgnored && node.isIgnored) {
+        return false;
+      }
+
       // Device role filter
       if (nodeFilters.deviceRoles.length > 0) {
         const role = typeof node.user?.role === 'number' ? node.user.role : parseInt(node.user?.role || '0');
@@ -3053,7 +3117,8 @@ function App() {
   }, [
     nodes,
     maxNodeAgeHours,
-    nodeFilter,
+    activeTab,
+    nodesNodeFilter,
     sortField,
     sortDirection,
     nodeFilters,
@@ -3433,6 +3498,18 @@ function App() {
                   <span>Unknown nodes</span>
                 </span>
               </label>
+
+              <label className="filter-checkbox">
+                <input
+                  type="checkbox"
+                  checked={nodeFilters.showIgnored}
+                  onChange={e => setNodeFilters({ ...nodeFilters, showIgnored: e.target.checked })}
+                />
+                <span className="filter-label-with-icon">
+                  <span className="filter-icon">🚫</span>
+                  <span>Show ignored nodes</span>
+                </span>
+              </label>
             </div>
 
             <div className="filter-section">
@@ -3623,6 +3700,7 @@ function App() {
                   maxHops: 10,
                   showPKI: false,
                   showUnknown: false,
+                  showIgnored: false,
                   deviceRoles: [],
                   channels: [],
                 })
@@ -3812,134 +3890,20 @@ function App() {
         </div>
       </header>
 
-      {/* Default Password Warning Banner */}
-      {isDefaultPassword && (
-        <div className="warning-banner">
-          ⚠️ Security Warning: The admin account is using the default password. Please change it immediately in the
-          Users tab.
-        </div>
-      )}
-
-      {/* TX Disabled Warning Banner */}
-      {isTxDisabled && (
-        <div
-          className="warning-banner"
-          style={{
-            top: isDefaultPassword ? 'calc(var(--header-height) + var(--banner-height))' : 'var(--header-height)',
-          }}
-        >
-          ⚠️ Transmit Disabled: Your device cannot send messages. TX is currently disabled in the LoRa configuration.
-          Enable it via the Meshtastic app or re-import your configuration.
-        </div>
-      )}
-
-      {/* Configuration Issue Warning Banners */}
-      {configIssues.map((issue, index) => {
-        // Calculate how many banners are above this one
-        const bannersAbove = [isDefaultPassword, isTxDisabled].filter(Boolean).length + index;
-        const topOffset =
-          bannersAbove === 0
-            ? 'var(--header-height)'
-            : `calc(var(--header-height) + (var(--banner-height) * ${bannersAbove}))`;
-
-        return (
-          <div key={issue.type} className="warning-banner" style={{ top: topOffset }}>
-            ⚠️ Configuration Error: {issue.message}{' '}
-            <a
-              href={issue.docsUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: 'inherit', textDecoration: 'underline' }}
-            >
-              Learn more →
-            </a>
-          </div>
-        );
-      })}
-
-      {/* Don't show banner until images are confirmed ready - no point notifying users about builds in progress */}
-
-      {updateAvailable &&
-        (() => {
-          // Calculate total warning banners above the update banner
-          const warningBannersCount = [isDefaultPassword, isTxDisabled].filter(Boolean).length + configIssues.length;
-          const topOffset =
-            warningBannersCount === 0
-              ? 'var(--header-height)'
-              : `calc(var(--header-height) + (var(--banner-height) * ${warningBannersCount}))`;
-
-          return (
-            <div className="update-banner" style={{ top: topOffset }}>
-              <div
-                style={{
-                  flex: 1,
-                  textAlign: 'center',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '1rem',
-                }}
-              >
-                {upgradeInProgress ? (
-                  <>
-                    <span>⚙️ Upgrading to {latestVersion}...</span>
-                    <span style={{ fontSize: '0.9em', opacity: 0.9 }}>{upgradeStatus}</span>
-                    {upgradeProgress > 0 && (
-                      <span style={{ fontSize: '0.9em', opacity: 0.9 }}>({upgradeProgress}%)</span>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <span>🔔 Update Available: Version {latestVersion} is now available.</span>
-                    <a
-                      href={releaseUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={{
-                        color: 'white',
-                        textDecoration: 'underline',
-                        fontWeight: '600',
-                      }}
-                    >
-                      View Release Notes →
-                    </a>
-                    {upgradeEnabled && (
-                      <button
-                        onClick={handleUpgrade}
-                        style={{
-                          padding: '0.4rem 1rem',
-                          backgroundColor: '#10b981',
-                          color: 'white',
-                          border: 'none',
-                          borderRadius: '4px',
-                          cursor: 'pointer',
-                          fontWeight: '600',
-                          fontSize: '0.9em',
-                          transition: 'background-color 0.2s',
-                        }}
-                        onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#059669')}
-                        onMouseLeave={e => (e.currentTarget.style.backgroundColor = '#10b981')}
-                        title="Automatically upgrade to the latest version"
-                      >
-                        Upgrade Now
-                      </button>
-                    )}
-                  </>
-                )}
-              </div>
-              {!upgradeInProgress && (
-                <button
-                  className="banner-dismiss"
-                  onClick={() => setUpdateAvailable(false)}
-                  aria-label="Dismiss update notification"
-                  title="Dismiss"
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-          );
-        })()}
+      <AppBanners
+        isDefaultPassword={isDefaultPassword}
+        isTxDisabled={isTxDisabled}
+        configIssues={configIssues}
+        updateAvailable={updateAvailable}
+        latestVersion={latestVersion}
+        releaseUrl={releaseUrl}
+        upgradeEnabled={upgradeEnabled}
+        upgradeInProgress={upgradeInProgress}
+        upgradeStatus={upgradeStatus}
+        upgradeProgress={upgradeProgress}
+        onUpgrade={handleUpgrade}
+        onDismissUpdate={() => setUpdateAvailable(false)}
+      />
 
       <LoginModal isOpen={showLoginModal} onClose={() => setShowLoginModal(false)} />
       <RebootModal isOpen={showRebootModal} onClose={handleRebootModalClose} />
@@ -3984,143 +3948,17 @@ function App() {
         />
       )}
 
-      {/* Purge Data Modal */}
-      {showPurgeDataModal && selectedDMNode && (
-        <div className="modal-overlay" onClick={() => setShowPurgeDataModal(false)}>
-          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: '500px' }}>
-            <div className="modal-header">
-              <h2>⚠️ Purge Data for {getNodeName(selectedDMNode)}</h2>
-              <button className="modal-close" onClick={() => setShowPurgeDataModal(false)}>
-                &times;
-              </button>
-            </div>
-            <div className="modal-body">
-              <p style={{ marginBottom: '1.5rem', color: '#dc3545', fontWeight: 'bold' }}>
-                These actions cannot be undone. All data for this node will be permanently deleted.
-              </p>
-              <div style={{ display: 'flex', flexDirection: 'row', gap: '0.75rem', flexWrap: 'wrap' }}>
-                <button
-                  onClick={() => {
-                    const selectedNode = nodes.find(n => n.user?.id === selectedDMNode);
-                    if (selectedNode) {
-                      handlePurgeDirectMessages(selectedNode.nodeNum);
-                      setShowPurgeDataModal(false);
-                    }
-                  }}
-                  className="danger-btn"
-                  style={{
-                    backgroundColor: '#dc3545',
-                    color: 'white',
-                    border: 'none',
-                    padding: '0.75rem 1rem',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontWeight: 'bold',
-                    fontSize: '1rem',
-                  }}
-                >
-                  🗑️ Purge All Messages
-                </button>
-                <button
-                  onClick={() => {
-                    const selectedNode = nodes.find(n => n.user?.id === selectedDMNode);
-                    if (selectedNode) {
-                      handlePurgeNodeTraceroutes(selectedNode.nodeNum);
-                      setShowPurgeDataModal(false);
-                    }
-                  }}
-                  className="danger-btn"
-                  style={{
-                    backgroundColor: '#dc3545',
-                    color: 'white',
-                    border: 'none',
-                    padding: '0.75rem 1rem',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontWeight: 'bold',
-                    fontSize: '1rem',
-                  }}
-                >
-                  🗺️ Purge Traceroutes
-                </button>
-                <button
-                  onClick={() => {
-                    const selectedNode = nodes.find(n => n.user?.id === selectedDMNode);
-                    if (selectedNode) {
-                      handlePurgeNodeTelemetry(selectedNode.nodeNum);
-                      setShowPurgeDataModal(false);
-                    }
-                  }}
-                  className="danger-btn"
-                  style={{
-                    backgroundColor: '#dc3545',
-                    color: 'white',
-                    border: 'none',
-                    padding: '0.75rem 1rem',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontWeight: 'bold',
-                    fontSize: '1rem',
-                  }}
-                >
-                  📊 Purge Telemetry
-                </button>
-              </div>
-              <hr style={{ margin: '1.5rem 0', borderColor: '#dee2e6' }} />
-              <p style={{ marginBottom: '1rem', fontWeight: 'bold' }}>Delete Node Completely:</p>
-              <p style={{ marginBottom: '1rem', fontSize: '0.9rem', color: '#6c757d' }}>
-                Choose how to delete the node - from local database only, or from both the device and database.
-              </p>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                <button
-                  onClick={() => {
-                    const selectedNode = nodes.find(n => n.user?.id === selectedDMNode);
-                    if (selectedNode) {
-                      handleDeleteNode(selectedNode.nodeNum);
-                    }
-                  }}
-                  className="danger-btn"
-                  style={{
-                    backgroundColor: '#721c24',
-                    color: 'white',
-                    border: 'none',
-                    padding: '0.75rem 1rem',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontWeight: 'bold',
-                    fontSize: '1rem',
-                    width: '100%',
-                  }}
-                >
-                  ❌ Delete Node (Local Database Only)
-                </button>
-                <button
-                  onClick={() => {
-                    const selectedNode = nodes.find(n => n.user?.id === selectedDMNode);
-                    if (selectedNode) {
-                      handlePurgeNodeFromDevice(selectedNode.nodeNum);
-                    }
-                  }}
-                  className="danger-btn"
-                  style={{
-                    backgroundColor: '#5a0a0a',
-                    color: 'white',
-                    border: 'none',
-                    padding: '0.75rem 1rem',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontWeight: 'bold',
-                    fontSize: '1rem',
-                    width: '100%',
-                  }}
-                >
-                  🗑️ Purge from Device AND Database
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <PurgeDataModal
+        isOpen={showPurgeDataModal}
+        selectedNode={selectedDMNode ? nodes.find(n => n.user?.id === selectedDMNode) || null : null}
+        onClose={() => setShowPurgeDataModal(false)}
+        onPurgeMessages={handlePurgeDirectMessages}
+        onPurgeTraceroutes={handlePurgeNodeTraceroutes}
+        onPurgeTelemetry={handlePurgeNodeTelemetry}
+        onDeleteNode={handleDeleteNode}
+        onPurgeFromDevice={handlePurgeNodeFromDevice}
+        getNodeName={getNodeName}
+      />
 
       {selectedRouteSegment && (
         <RouteSegmentTraceroutesModal
@@ -4196,7 +4034,6 @@ function App() {
             shouldShowData={shouldShowData}
             centerMapOnNode={centerMapOnNode}
             toggleFavorite={toggleFavorite}
-            toggleIgnored={toggleIgnored}
             setActiveTab={setActiveTab}
             setSelectedDMNode={setSelectedDMNode}
             markerRefs={markerRefs}
@@ -4261,8 +4098,10 @@ function App() {
             setReplyingTo={setReplyingTo}
             unreadCountsData={unreadCountsData}
             markMessagesAsRead={markMessagesAsRead}
-            nodeFilter={nodeFilter}
-            setNodeFilter={setNodeFilter}
+            nodeFilter={_nodeFilter} // Deprecated - kept for backward compatibility
+            setNodeFilter={_setNodeFilter} // Deprecated
+            messagesNodeFilter={messagesNodeFilter}
+            setMessagesNodeFilter={setMessagesNodeFilter}
             dmFilter={dmFilter}
             setDmFilter={setDmFilter}
             securityFilter={securityFilter}
@@ -4293,6 +4132,7 @@ function App() {
             setEmojiPickerMessage={setEmojiPickerMessage}
             shouldShowData={shouldShowData}
             dmMessagesContainerRef={dmMessagesContainerRef}
+            toggleIgnored={toggleIgnored}
           />
         )}
         {activeTab === 'info' && (
