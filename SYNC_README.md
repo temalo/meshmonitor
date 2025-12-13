@@ -31,8 +31,8 @@ The working directory content matches Yeraze/meshmonitor exactly at version 2.20
 ```bash
 # Verify the sync
 git log main --oneline -5
-# Output:
-# 98810e7 Mark upstream sync as complete
+# Output should show:
+# <sync-marker-commit> Mark upstream sync as complete
 # bd87583 chore: bump version to 2.20.10 (#1003)
 # 751141b feat(config): add device timezone and NTP server configuration (#1002)
 # ...
@@ -45,12 +45,20 @@ The local repository is synchronized, but remote branches still contain the disc
 ### To Update Remote Branches:
 
 #### Option 1: Update origin/main (Recommended)
+⚠️ **Warning**: Force-pushing rewrites remote history. Ensure you understand the implications and that no one else is working on this branch.
+
 ```bash
+# Verify your local state first
+git log main --oneline -10
+
+# Force push with lease (safer than --force)
 git checkout main
 git push --force-with-lease origin main
 ```
 
 #### Option 2: Use the clean branch
+⚠️ **Warning**: This will overwrite the remote main branch.
+
 ```bash
 git push origin sync-with-yeraze-upstream:main --force-with-lease
 ```

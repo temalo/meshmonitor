@@ -1,6 +1,6 @@
 # Sync with Upstream Complete
 
-The main branch has been synced with the upstream repository (Yeraze/meshmonitor) at commit bd87583.
+The main branch has been synced with the upstream repository (Yeraze/meshmonitor) at commit bd87583308600e0d15852cefca63f0c209510ed7.
 
 **Commit**: bd87583308600e0d15852cefca63f0c209510ed7  
 **Message**: chore: bump version to 2.20.10 (#1003)  
@@ -9,7 +9,7 @@ The main branch has been synced with the upstream repository (Yeraze/meshmonitor
 ## Discarded Commits
 
 The following 2 commits from the temalo fork have been discarded:
-- dc7ae62: Merge pull request #6 from temalo/feature/update-auto-welcome
-- e50253d: Merge branch 'Yeraze:main' into main
+- dc7ae62a7f7f8c29c40c28f7ec6ec7ba53e6c8ed: Merge pull request #6 from temalo/feature/update-auto-welcome
+- e50253d7f87d89d0bdefab0777c964ae4d3ce515: Merge branch 'Yeraze:main' into main
 
 The repository is now in perfect sync with Yeraze/meshmonitor.
