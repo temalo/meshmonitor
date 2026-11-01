@@ -27,6 +27,7 @@ import {
   postgresAvailable,
   mysqlAvailable,
 } from './test-utils.js';
+import { ALL_SOURCES } from './base.js';
 
 const SRC_A = 'source-a';
 const SRC_B = 'source-b';
@@ -401,7 +402,7 @@ function runReticulumTests(getBackend: () => TestBackend) {
     pruneSpy.mockRestore();
   });
 
-  it('countDestinations / countInterfaces - match list length without loading full rows', async () => {
+  it('countDestinations / countInterfaces - count destinations and online interfaces without loading full rows', async () => {
     const backend = getBackend();
     if (!backend.available) {
       console.log(`⚠ Skipped: ${backend.skipReason}`);
@@ -420,6 +421,41 @@ function runReticulumTests(getBackend: () => TestBackend) {
     expect(await repo.countDestinations(SRC_B)).toBe(1);
     expect(await repo.countInterfaces(SRC_A)).toBe(1);
     expect(await repo.countInterfaces(SRC_B)).toBe(0);
+  });
+
+  it('markMissingInterfacesOffline - retires only absent rows on the named source (#6121)', async () => {
+    if (!getBackend().available) return;
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'keep' }));
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'missing' }));
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'reported-down', online: false, status: 'down' }));
+    await repo.upsertInterface(SRC_B, makeIface({ interfaceName: 'missing' }));
+    const before = await repo.getInterface(SRC_A, 'missing');
+    await repo.setInterfaceRadioConfig(SRC_A, 'missing', { frequency: 915_000_000 });
+
+    await repo.markMissingInterfacesOffline(SRC_A, ['keep', 'reported-down']);
+    expect(await repo.getInterface(SRC_A, 'missing')).toMatchObject({
+      online: false, status: 'down', txBytes: before!.txBytes, rxBytes: before!.rxBytes,
+      lastSeenAt: before!.lastSeenAt, createdAt: before!.createdAt, frequency: 915_000_000,
+    });
+    expect(await repo.countInterfaces(SRC_A)).toBe(1);
+    expect(await repo.countInterfaces(SRC_B)).toBe(1);
+    expect(await repo.countInterfaces(ALL_SOURCES)).toBe(2);
+
+    await repo.markMissingInterfacesOffline(SRC_A, []);
+    expect(await repo.countInterfaces(SRC_A)).toBe(0);
+    expect(await repo.countInterfaces(SRC_B)).toBe(1);
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'missing' }));
+    expect(await repo.countInterfaces(SRC_A)).toBe(1);
+    expect(await repo.getInterface(SRC_A, 'missing')).toMatchObject({
+      id: before!.id, online: true, status: 'up', frequency: 915_000_000,
+    });
+  });
+
+  it('markMissingInterfacesOffline - fails closed on an empty source id (#6121)', async () => {
+    if (!getBackend().available) return;
+    await repo.upsertInterface(SRC_A, makeIface());
+    await expect(repo.markMissingInterfacesOffline('', [])).rejects.toThrow(/sourceId is required/);
+    expect(await repo.countInterfaces(SRC_A)).toBe(1);
   });
 
   // ============ Position (Phase 3 WP3, migration 144) ============

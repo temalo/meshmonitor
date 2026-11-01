@@ -48,6 +48,7 @@ vi.mock('../services/database.js', () => ({
     reticulum: {
       upsertDestination: (...args: unknown[]) => upsertDestination(...args),
       upsertInterface: (...args: unknown[]) => upsertInterface(...args),
+      markMissingInterfacesOffline: vi.fn().mockResolvedValue(undefined),
       upsertMessage: (...args: unknown[]) => upsertMessage(...args),
       updateMessageState: (...args: unknown[]) => updateMessageState(...args),
       renameMessageId: (...args: unknown[]) => renameMessageId(...args),

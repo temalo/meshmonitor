@@ -24,6 +24,7 @@ vi.mock('../services/database.js', () => ({
     reticulum: {
       upsertDestination: (...args: unknown[]) => upsertDestination(...args),
       upsertInterface: (...args: unknown[]) => upsertInterface(...args),
+      markMissingInterfacesOffline: vi.fn().mockResolvedValue(undefined),
     },
     telemetry: {
       insertTelemetryBatch: (...args: unknown[]) => insertTelemetryBatch(...args),

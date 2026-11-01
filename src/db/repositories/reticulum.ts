@@ -16,7 +16,7 @@
  * the full column rationale (rssi/snr/quality included, position/telemetry
  * and LoRa-parameter columns excluded — those are Phase 3).
  */
-import { and, asc, desc, eq, inArray, isNotNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, lt, notInArray, or, sql } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase, SourceScope } from './base.js';
 import { DatabaseType } from '../types.js';
 import { SettingsRepository } from './settings.js';
@@ -644,6 +644,22 @@ export class ReticulumRepository extends BaseRepository {
     );
   }
 
+  /**
+   * Retire interfaces absent from a full snapshot (#6121). Keep the row's
+   * counters, lastSeenAt and radio config for history/reappearance; absence
+   * is not a new observation. An empty snapshot retires this source only.
+   */
+  async markMissingInterfacesOffline(sourceId: string, interfaceNames: string[]): Promise<void> {
+    const { reticulumInterfaces } = this.tables;
+    await this.db.update(reticulumInterfaces)
+      .set({ online: false, status: 'down', updatedAt: this.now() })
+      .where(and(
+        this.withSourceScope(reticulumInterfaces, sourceId),
+        eq(reticulumInterfaces.online, true),
+        interfaceNames.length > 0 ? notInArray(reticulumInterfaces.interfaceName, interfaceNames) : undefined,
+      ));
+  }
+
   /** List all interfaces for a source (or `ALL_SOURCES`), ordered by name. */
   async listInterfaces(sourceId: SourceScope): Promise<ReticulumInterfaceRow[]> {
     const { reticulumInterfaces } = this.tables;
@@ -656,15 +672,15 @@ export class ReticulumRepository extends BaseRepository {
   }
 
   /**
-   * Count interface rows for a source (or `ALL_SOURCES`) without loading
-   * full rows — see {@link countDestinations}.
+   * Count online interfaces for a source (or `ALL_SOURCES`) without loading
+   * full rows. Offline snapshots remain available through listInterfaces.
    */
   async countInterfaces(sourceId: SourceScope): Promise<number> {
     const { reticulumInterfaces } = this.tables;
     const rows = await this.db
       .select({ count: sql<number>`COUNT(*)` })
       .from(reticulumInterfaces)
-      .where(this.withSourceScope(reticulumInterfaces, sourceId));
+      .where(and(this.withSourceScope(reticulumInterfaces, sourceId), eq(reticulumInterfaces.online, true)));
     return Number(rows[0]?.count ?? 0);
   }
 

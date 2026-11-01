@@ -146,6 +146,9 @@ export class ReticulumManager extends EventEmitter implements ISourceManager {
    */
   private readonly lastInterfaceSample = new Map<string, InterfaceSample>();
 
+  /** Serialize full snapshots so a slow older poll cannot resurrect missing rows (#6121). */
+  private interfaceStatsQueue: Promise<void> = Promise.resolve();
+
   /**
    * Last-seen bridge/RNS versions (#3960 Phase 1b WP-B). `bridgeVersion` only
    * ever arrives on the `welcome` handshake message; `rnsVersion` arrives on
@@ -858,7 +861,15 @@ export class ReticulumManager extends EventEmitter implements ISourceManager {
    * given interface's byte counters actually advanced since the last poll —
    * see {@link lastInterfaceSample}).
    */
-  private async handleInterfaceStats(msg: InterfaceStatsMessage): Promise<void> {
+  private handleInterfaceStats(msg: InterfaceStatsMessage): Promise<void> {
+    const pending = this.interfaceStatsQueue.then(() => this.persistInterfaceStats(msg));
+    // The returned promise still rejects for the event listener to log. Recover
+    // only the queue tail, so one failed snapshot cannot poison future polls.
+    this.interfaceStatsQueue = pending.catch(() => {});
+    return pending;
+  }
+
+  private async persistInterfaceStats(msg: InterfaceStatsMessage): Promise<void> {
     const rows: DbTelemetry[] = [];
     const writtenAt = Date.now();
 
@@ -886,6 +897,12 @@ export class ReticulumManager extends EventEmitter implements ISourceManager {
       }
 
       this.pushInterfaceHistoryRows(rows, iface, msg.ts, writtenAt);
+    }
+
+    const names = new Set(msg.interfaces.map(iface => iface.name));
+    await databaseService.reticulum.markMissingInterfacesOffline(this.sourceId, [...names]);
+    for (const name of this.lastInterfaceSample.keys()) {
+      if (!names.has(name)) this.lastInterfaceSample.delete(name);
     }
 
     if (rows.length === 0) return;
